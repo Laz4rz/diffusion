@@ -67,8 +67,12 @@ $$p_\theta(x_{t-1}|x_t)=q(x_{t-1}|x_t,\tilde x_0)$$
 
 Knowing what we want to achieve and how, we move to the loss function: 
 
-$$Lvb = E_{q(x0) q(x1|x0) q(x2|x1) ... q(xT|xT-1)} 
-      [ -log p(x_T) + Σ_{t=2}^T log(q(xt-1|xt,x0)/pθ(xt-1|xt)) - log pθ(x0|x1) ]$$
+$$L_{vb} = E_{q(x_0)} \left[ D_{KL}[q(x_T |x_0) || p(x_T)] + \sum_{t=2}^T E_{q(x_t |x_0)} [D_{KL}[q(x_{t-1}|x_t, x_0) || p_\theta(x_{t-1}|x_t)]] - E_{q(x_1|x_0)}[\log p_\theta(x_0|x_1)] \right]$$
+
+$$L_{\text{simple}} = E_t \left[ E_{q(x_0, x_t)} [ -\log p_\theta(x_0|x_t) ] \right]$$
+
+$$L_{\lambda} = L_{vb} + \lambda L_{simple}$$
 
 ### Important:
+https://yunfanj.com/blog/2021/01/11/ELBO.html
 https://www.wpeebles.com/DiT
