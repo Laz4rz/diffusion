@@ -73,6 +73,56 @@ $$L_{\text{simple}} = E_t \left[ E_{q(x_0, x_t)} [ -\log p_\theta(x_0|x_t) ] \ri
 
 $$L_{\lambda} = L_{vb} + \lambda L_{simple}$$
 
+## Math cheatsheet
+
+$
+\begin{aligned}
+\textbf{Latent variable} &:\quad z \\
+\textbf{Observed data} &:\quad D \\[4pt]
+\textbf{Prior} &:\quad p(z) \\
+\textbf{Likelihood} &:\quad p(D \mid z) \\[4pt]
+\textbf{Joint} &:\quad p(z, D) \;=\; p(z)\,p(D \mid z) \;=\; p(z \mid D)\,p(D) \\[4pt]
+\textbf{Evidence / marginal likelihood} &:\quad p(D) \;=\; \int p(z)\,p(D \mid z)\,dz \\
+\textbf{Posterior} &:\quad p(z \mid D) \;=\; \dfrac{p(z)\,p(D \mid z)}{p(D)} \\
+\textbf{Surrogate} &:\quad q(z) \\
+\end{aligned}
+$
+
+### KL Divergence
+$$
+D_{\mathrm{KL}}\!\left(q(z)\,\|\,p(z\mid D)\right)
+= \mathbb{E}_{z\sim q(z)}\!\left[ \log \frac{q(z)}{p(z\mid D)} \right]
+= \int\!\cdots\!\int q(z)\,\log\!\frac{q(z)}{p(z\mid D)}\,dz_0\cdots dz_{d-1}.
+$$
+
+### KL Divergence between surrogate and posterior (ELBO derivation)
+$$
+D_{KL}(q(z)||p(z|D)) = \mathbb E_{z\sim q(z)}[\log\frac{q(z)\cdot p(D)}{p(z,D)}]=\int_{\bar{z}}q(z)\log\frac{q(z)\cdot p(D)}{p(z,D)}d\bar{z}\\$$
+
+We use the join identity, split and move back to expectations.
+
+$$=\int_{\bar{z}}q(z)\log\frac{q(z)}
+{p(z,D)}d\bar{z}+\int_{\bar{z}}q(z)\log p(D)d\bar{z}=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \mathbb E_{z\sim q(z)}[\log p(z,D)]
+$$
+
+Now the second term is nicely constant. 
+
+$$
+=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \log p(z,D) = \underbrace{-\mathbb E_{z\sim q(z)}[\log\frac{p(z,D)}{q(z)}]}_{\mathcal{L}(q)} + \log p(z,D) 
+$$
+
+So now we have the KL divergence as one term dependent on the surrogate $q$ and one constant (evidence, negative) term:
+
+$$
+\mathrm{KL}
+\;=\;
+-\,\mathcal{L}(q)
+\;+\;
+\underbrace{\log \overbrace{p(D)}^{\text{marginal (constant)}}}_{\text{evidence}}
+$$
+
+We know that KL is a distance so $\mathrm{KL} \ge 0 \rightarrow $
+
 ### Important:
-https://yunfanj.com/blog/2021/01/11/ELBO.html
+https://yunfanj.com/blog/2021/01/11/ELBO.html \
 https://www.wpeebles.com/DiT
