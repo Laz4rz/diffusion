@@ -37,7 +37,7 @@ Funnily, D3PM follows another paper and instead of predicting $p_\theta$ directl
 
 $$p_\theta(x_{t-1}|x_t)\propto\sum_{\tilde x_0}q(x_{t-1}|x_t,\tilde x_0)\cdot\tilde p_\theta(\tilde x_0|x_t)$$
 
-Full Bayes form is belowe, but as we see it's normalized by default.
+Full Bayes form is below, but as we see it's normalized by default.
 
 $$p_\theta(x_{t-1}\mid x_t)
 \;=\;
@@ -90,25 +90,35 @@ $
 
 ### KL Divergence
 $$
-D_{\mathrm{KL}}\!\left(q(z)\,\|\,p(z\mid D)\right)
-= \mathbb{E}_{z\sim q(z)}\!\left[ \log \frac{q(z)}{p(z\mid D)} \right]
-= \int\!\cdots\!\int q(z)\,\log\!\frac{q(z)}{p(z\mid D)}\,dz_0\cdots dz_{d-1}.
+D_{\mathrm{KL}}\big(q(\bar z)\;||\;p(\bar z D)\big)
+= \mathbb{E}_{\bar z\sim q(\bar z)}\left[ \log \frac{q(\bar z)}{p(\bar z\mid D)} \right]
+= \int q(\bar z)\log\frac{q(\bar z)}{p(\bar z\mid D)}d\bar z \\
+=\int\cdots\int q(z_0,\ldots,z_{d-1})
+\log\frac{q(z_0,\ldots,z_{d-1})}{p(z_0,\ldots,z_{d-1}\mid D)}
+dz_0\cdots dz_{d-1}.
 $$
 
 ### KL Divergence between surrogate and posterior (ELBO derivation)
-$$
-D_{KL}(q(z)||p(z|D)) = \mathbb E_{z\sim q(z)}[\log\frac{q(z)\cdot p(D)}{p(z,D)}]=\int_{\bar{z}}q(z)\log\frac{q(z)\cdot p(D)}{p(z,D)}d\bar{z}\\$$
 
-We use the join identity, split and move back to expectations.
+Variational Inference Surrogate Optimization (fitting some function that will model the posterior) can be written as:
+
+$$q(\bar z)=\argmin_{q(\bar z)\in Q}(\mathrm{KL}(q(\bar z) \; || \; p(\bar z|D))$$
+
+The problem is that we do not and will not have the posterior, because it's exactly the thing we want to model. Hence we look closer at the KL term and do all subsequent steps. We will change the optimization problem we are working on.
+
+$$
+D_{KL}(q(\bar z)||p(\bar z|D)) = \mathbb E_{z\sim q(z)}[\log\frac{q(z)\cdot p(D)}{p(z,D)}]=\int_{\bar{z}}q(z)\log\frac{q(z)\cdot p(D)}{p(z,D)}d\bar{z}\\$$
+
+We use the Bayes rule, split and move back to expectations.
 
 $$=\int_{\bar{z}}q(z)\log\frac{q(z)}
-{p(z,D)}d\bar{z}+\int_{\bar{z}}q(z)\log p(D)d\bar{z}=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \mathbb E_{z\sim q(z)}[\log p(z,D)]
+{p(z,D)}d\bar{z}+\int_{\bar{z}}q(z)\log p(D)d\bar{z}=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \mathbb E_{z\sim q(z)}[\log p(D)]
 $$
 
 Now the second term is nicely constant. 
 
 $$
-=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \log p(z,D) = \underbrace{-\mathbb E_{z\sim q(z)}[\log\frac{p(z,D)}{q(z)}]}_{\mathcal{L}(q)} + \log p(z,D) 
+=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \log p(D) = \underbrace{-\mathbb E_{z\sim q(z)}[\log\frac{p(z,D)}{q(z)}]}_{\mathcal{L}(q)} + \log p(D) 
 $$
 
 So now we have the KL divergence as one term dependent on the surrogate $q$ and one constant (evidence, negative) term:
@@ -121,7 +131,17 @@ $$
 \underbrace{\log \overbrace{p(D)}^{\text{marginal (constant)}}}_{\text{evidence}}
 $$
 
-We know that KL is a distance so $\mathrm{KL} \ge 0 \rightarrow $
+We know that KL is a distance so $\mathrm{KL} \ge 0 \Rightarrow \mathcal L(q) \le \log C$. $\mathcal L(q)$ is so called Evidence Lower Bound or ELBO for short. 
+
+$$\mathrm{ELBO}: \;\mathcal L(q) = \mathbb E_{\bar{z}\sim q(\bar z)}[\log\frac{p(z, D)}{q(\bar z)}] \;\; \text{and} \mathcal \;\; L(q)=\log p(D) \Leftrightarrow D_{KL}(q(\bar z)||p(\bar z|D)) = 0$$
+
+Usually we will not find an ideal fit, but we will at least go towards it. Thanks to the above we can rewrite the original optimization problem to:
+
+$$q^\star(\bar z ) = \argmax_{q(\bar z)\in Q} \mathcal L(q)$$
+
+We can do that because we know that 1). $\mathcal L(q)$ can be at most equal to evidence or lower (it is it's lower bound), 2). if $\mathcal L(q)$ is equal to evidence then $\mathrm{KL}$ is minimized, which is the goal of the original problem. Hence we can rewrite:
+
+$$\mathcal L(q) = -\mathrm{KL} + \log p(D)$$
 
 ### Important:
 https://yunfanj.com/blog/2021/01/11/ELBO.html \
