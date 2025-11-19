@@ -88,6 +88,8 @@ $
 \end{aligned}
 $
 
+Prior in variational inference is a design choice of a distribution we try to "balance" or "regularize" the Surrogate with. Posterior is a data backed ground truth. ELBO can be rewritten as balancing between these two representations.
+
 ### KL Divergence
 $$
 D_{\mathrm{KL}}\big(q(\bar z)\;||\;p(\bar z D)\big)
@@ -102,23 +104,23 @@ $$
 
 Variational Inference Surrogate Optimization (fitting some function that will model the posterior) can be written as:
 
-$$q(\bar z)=\argmin_{q(\bar z)\in Q}(\mathrm{KL}(q(\bar z) \; || \; p(\bar z|D))$$
+$$q^\star(\underline{z})=\argmin_{q(\underline{z})\in Q}(\mathrm{KL}(q(\underline{z}) \; || \; p(\underline{z}|D))$$
 
 The problem is that we do not and will not have the posterior, because it's exactly the thing we want to model. Hence we look closer at the KL term and do all subsequent steps. We will change the optimization problem we are working on.
 
 $$
-D_{KL}(q(\bar z)||p(\bar z|D)) = \mathbb E_{z\sim q(z)}[\log\frac{q(z)\cdot p(D)}{p(z,D)}]=\int_{\bar{z}}q(z)\log\frac{q(z)\cdot p(D)}{p(z,D)}d\bar{z}\\$$
+D_{KL}(q(\underline{z})||p(\underline{z}|D)) = \mathbb E_{\underline{z}\sim q(\underline{z})}[\log\frac{q(\underline{z})\cdot p(D)}{p(\underline{z},D)}]=\int q(\underline{z})\log\frac{q(\underline{z})\cdot p(D)}{p(\underline{z},D)}d\underline{z}\\$$
 
 We use the Bayes rule, split and move back to expectations.
 
-$$=\int_{\bar{z}}q(z)\log\frac{q(z)}
-{p(z,D)}d\bar{z}+\int_{\bar{z}}q(z)\log p(D)d\bar{z}=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \mathbb E_{z\sim q(z)}[\log p(D)]
+$$=\int q(\underline{z})\log\frac{q(\underline{z})}
+{p(\underline{z},D)}d\underline{z}+\int q(\underline{z})\log p(D)d\underline{z}=\mathbb E_{\underline{z}\sim q(\underline{z})}[\log\frac{q(\underline{z})}{p(\underline{z},D)}] + \mathbb E_{\underline{z}\sim q(\underline{z})}[\log p(D)]
 $$
 
 Now the second term is nicely constant. 
 
 $$
-=\mathbb E_{z\sim q(z)}[\log\frac{q(z)}{p(z,D)}] + \log p(D) = \underbrace{-\mathbb E_{z\sim q(z)}[\log\frac{p(z,D)}{q(z)}]}_{\mathcal{L}(q)} + \log p(D) 
+=\mathbb E_{\underline{z}\sim q(\underline{z})}[\log\frac{q(\underline{z})}{p(\underline{z},D)}] + \log p(D) = \underbrace{-\mathbb E_{\underline{z}\sim q(\underline{z})}[\log\frac{p(\underline{z},D)}{q(\underline{z})}]}_{\mathcal{L}(q)} + \log p(D) 
 $$
 
 So now we have the KL divergence as one term dependent on the surrogate $q$ and one constant (evidence, negative) term:
@@ -131,17 +133,42 @@ $$
 \underbrace{\log \overbrace{p(D)}^{\text{marginal (constant)}}}_{\text{evidence}}
 $$
 
-We know that KL is a distance so $\mathrm{KL} \ge 0 \Rightarrow \mathcal L(q) \le \log C$. $\mathcal L(q)$ is so called Evidence Lower Bound or ELBO for short. 
+We know that KL is a distance so $\mathrm{KL} \ge 0 \Rightarrow \mathcal L(q) \le \log p(D)$. $\mathcal L(q)$ is so called Evidence Lower Bound or ELBO for short. 
 
-$$\mathrm{ELBO}: \;\mathcal L(q) = \mathbb E_{\bar{z}\sim q(\bar z)}[\log\frac{p(z, D)}{q(\bar z)}] \;\; \text{and} \mathcal \;\; L(q)=\log p(D) \Leftrightarrow D_{KL}(q(\bar z)||p(\bar z|D)) = 0$$
+$$\mathrm{ELBO}: \;\mathcal L(q) = \mathbb E_{\underline{z}\sim q(\underline{z})}[\log\frac{p(\underline{z}, D)}{q(\underline{z})}] \;\; \text{and} \mathcal \;\; L(q)=\log p(D) \Leftrightarrow D_{KL}(q(\underline{z})||p(\underline{z}|D)) = 0$$
 
 Usually we will not find an ideal fit, but we will at least go towards it. Thanks to the above we can rewrite the original optimization problem to:
 
-$$q^\star(\bar z ) = \argmax_{q(\bar z)\in Q} \mathcal L(q)$$
+$$q^\star(\underline{z}) = \argmax_{q(\underline{z})\in Q} \mathcal L(q)$$
 
 We can do that because we know that 1). $\mathcal L(q)$ can be at most equal to evidence or lower (it is it's lower bound), 2). if $\mathcal L(q)$ is equal to evidence then $\mathrm{KL}$ is minimized, which is the goal of the original problem. Hence we can rewrite:
 
-$$\mathcal L(q) = -\mathrm{KL} + \log p(D)$$
+$$\mathcal L(q) = -\mathrm{KL} + \log p(D) = \underbrace{\mathbb{E}_{\underline{z} \sim q(\underline{z})}\left[\log \frac{p(\underline{z}, D)}{q(\underline{z})}\right]}_{\text{ELBO } \mathcal{L}(q)} 
+\;=\; 
+\underbrace{\log p(D)}_{\text{Evidence (Constant)}} 
+\;-\; 
+\underbrace{D_{KL}(q(\underline{z}) \;||\; p(\underline{z}|D))}_{\text{Approximation Gap } (\ge 0)}$$
+
+ELBO can also be rewritten as balancing between reconstruction and regularization:
+
+$$
+\mathcal{L}(q) = \underbrace{\mathbb{E}_{\underline{z} \sim q(\underline{z})}[\log p(D|\underline{z})]}_{\text{Reconstruction Error}} - \underbrace{D_{KL}(q(\underline{z}) \;||\; p(\underline{z}))}_{\text{Regularization}}
+$$
+
+### Amortized ELBO
+
+Above math is the theoretical take on variational inference derivation of surrogate and ELBO. In practice, like when training VAEs, this would mean that we have to find surrogate for each element of the dataset (tbh I don't see why, but yeah -- ok maybe somewhat good intuition is to look at reconstruction error and realize that if $D$ was all the data we have then we would be asking how good we are at reconstructing all the data at once... See the [Gemini example intuition](./notes_misc.md#global-surrogate-in-variational-inference)).
+
+Quick intuition is that the granularity of surrogates tell us how well we compress: 
+*   **Class-based (surrogate per training class) Surrogate ($q(z|y)$):** Compresses the **Label**. It tells the decoder "Draw a Dog."
+*   **Instance-based Surrogate (surrogate per training sample) ($q(z|x)$):** Compresses the **Image**. It tells the decoder "Draw a Dog with white fur, curly texture, floppy ears, facing 45 degrees left, with grass in the background."
+
+So what can we do about it? Turns out we - of course - can train a model to approximate the surrogate for us based on the data sample $x$. This introduces the dependency on $x$.
+
+*   **Classical VI:** Find the best parameters for $q(z)$.
+*   **VAE:** Find the best weights $\phi$ for a network **Encoder$(x)$** that outputs the parameters for $q(z|x)$.
+
+
 
 ### Important:
 https://yunfanj.com/blog/2021/01/11/ELBO.html \
