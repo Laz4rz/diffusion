@@ -92,7 +92,7 @@ Prior in variational inference is a design choice of a distribution we try to "b
 
 ### KL Divergence
 $$
-D_{\mathrm{KL}}\big(q(\bar z)\;||\;p(\bar z D)\big)
+D_{\mathrm{KL}}\big(q(\bar z)\;||\;p(\bar z |D)\big)
 = \mathbb{E}_{\bar z\sim q(\bar z)}\left[ \log \frac{q(\bar z)}{p(\bar z\mid D)} \right]
 = \int q(\bar z)\log\frac{q(\bar z)}{p(\bar z\mid D)}d\bar z \\
 =\int\cdots\int q(z_0,\ldots,z_{d-1})
@@ -157,6 +157,8 @@ $$
 
 ### Amortized ELBO
 
+Amortized means we use encoder neural network to learn surrogate $q_\phi(\bm z| \bm x)$.
+
 Above math is the theoretical take on variational inference derivation of surrogate and ELBO. In practice, like when training VAEs, this would mean that we have to find surrogate for each element of the dataset (tbh I don't see why, but yeah -- ok maybe somewhat good intuition is to look at reconstruction error and realize that if $D$ was all the data we have then we would be asking how good we are at reconstructing all the data at once... See the [Gemini example intuition](./notes_misc.md#global-surrogate-in-variational-inference)).
 
 Quick intuition is that the granularity of surrogates tell us how well we compress: 
@@ -167,6 +169,67 @@ So what can we do about it? Turns out we - of course - can train a model to appr
 
 *   **Classical VI:** Find the best parameters for $q(z)$.
 *   **VAE:** Find the best weights $\phi$ for a network **Encoder$(x)$** that outputs the parameters for $q(z|x)$.
+
+For this $x$ dependent surrogate we also assume that it is a diagonal Gaussian:
+
+$$q_{\phi}(\bold z|\bold x)=\mathcal N(\bold z; \bold\mu_{\phi}(\bold x),\sigma^2_{\phi}(\bold x)\odot\bold I)$$
+
+So we take data sample $\bold x$, put it in the encoder, encoder will output the $\bm\mu_{\phi}(\bold x),\bm\sigma^2_{\phi}(\bold x)$ vectors and we use them to sample $\bold z$ from Gaussian (we can't sample! but that's like 20 lines below) defined by these mean and variance vectors.
+
+In VAEs we use the Standard Multivariate Gaussian as prior:
+
+$$p(\bold z) = \mathcal N(z;0,\bold I)$$
+
+The decoder part of VAE is another neural network (we will assume it is some Gaussian with fixed variance) that we will defines as:
+
+$$
+p_\theta(\mathbf{x}| \mathbf{z}) = \mathcal{N}(\mathbf{x}; \mathbf{D}_\theta(\mathbf{z}), \mathbf{I}) = \frac{1}{\sqrt{(2\pi)^k}} \exp\left(-\frac{1}{2} ||\mathbf{x} - \mathbf{D}_\theta(\mathbf{z})||^2\right)
+$$
+
+$$\log p(\bm x|\bm z) = -\frac 1 2 ||x - \mathrm D_\theta(\bm z)||^2+C$$
+
+The log-likelihood is just copy pasted dw.
+
+Knowing the setup we can get back to deriving ELBO for VAEs. ELBO equation for a single data point is now:
+
+$$\mathcal L(\theta, \phi; \bold x)=\mathbb{E}_{\bold z \sim q_{\phi}(\bold z|\bold x)}[\log p_\theta(\bold x| \bold z)] - \mathrm{D_{KL}}(q_\phi(\bold z|\bold x)||p(\bold z))$$
+
+To get a loss function we can work with, we now have to solve both of these terms. Lets start with the regularization one. We defined both how $\bold q_\phi(\bold z| \bold x)$ and $p(\bold z)$ (prior) look like so we can write it as:
+
+$$\mathrm{D_{KL}}(q_\phi(\bold z|\bold x)||p(\bold z))\\=\mathrm{D_{KL}}(\mathcal N(\bm \mu,\bm \sigma^2)||\mathcal N(0,\bold I))=-\frac{1}{2}\sum_{j=1}^J(1+\log(\sigma^2_j)-\mu_j^2-\sigma^2_j)$$
+
+The result we get by divine intervention (I copy-pasted it). Regarding the reconstruction term, it is important that we can't take a derivative of sampling, so we use the "reparametrization trick" that will ["move" sampling outside of backward pass path](./notes_misc.md#vae-reparametrization-trick) (very cool Gemini):
+
+$$\bold z = \bm \mu_{\phi} + (\bm\sigma_{\phi} \odot \bm \epsilon)$$
+
+Then one can rewrite the reconstruction term as (why):
+
+$$\mathbb{E}_{\bold z \sim q_{\phi}(\bold z|\bold x)}[\log p_\theta(\bold x| \bold z)]=\mathbb{E}_{\bold \epsilon \sim \mathcal N(0,1)}[\log p_\theta(\bold x| \bm \mu_{\phi} + (\bm\sigma_{\phi} \odot \bm \epsilon))] = \int \mathcal N(\epsilon; 0,1)\log p(x| \bm\mu+\bm\sigma\odot\bm\epsilon)d\epsilon$$
+
+While we're at it, [why is VAE using Gaussians?](./notes_misc.md#why-is-vae-using-gaussians). So the gradient of just the reconstruction term we can write as:
+
+$$\nabla_\phi \mathbb{E}_{\bold \epsilon \sim \mathcal N(0,1)}[\log p_\theta(\bold x| \bm \mu_{\phi} + (\bm\sigma_{\phi} \odot \bm \epsilon))] = \mathbb{E}_{\bold \epsilon \sim \mathcal N(0,1)}[\nabla_{\phi}\log p_\theta(\bold x| \bm \mu_{\phi} + (\bm\sigma_{\phi} \odot \bm \epsilon))]\\\approx\frac 1 N \sum ^N _{i=1} \nabla_\phi \big(-\frac 1 2 ||x-\mathrm{Dec}(\mathrm{Enc}(x)_\mu + (\mathrm{Enc}(x)_\sigma\odot\epsilon))||^2\big) $$
+
+<!-- $$\mathcal L_\mathrm{rec} = \frac 1 {2N} \sum ||x-\hat x||^2$$ wrong -->
+
+Since we optimize by **Minimizing Loss** (which is equivalent to Maximizing ELBO), we flip the signs of the ELBO equation. This way both terms are now positive and we can properly minimize.
+
+$$ \text{Loss} = -\text{ELBO} = -\text{Reconstruction} + \text{KL Divergence} $$
+
+Given a batch of $N$ images $\{\mathbf{x}^{(1)}, \dots, \mathbf{x}^{(N)}\}$, and latent dimension size $J$:
+
+$$
+\mathcal{L}(\theta, \phi) \approx \frac{1}{N} \sum_{i=1}^N \left( 
+\underbrace{\frac{1}{2} ||\mathbf{x}^{(i)} - \mathrm{Dec}_\theta(\mathbf{z}^{(i)})||^2}_{\text{Reconstruction Loss (MSE)}} 
+\;+\; 
+\underbrace{\frac{1}{2} \sum_{j=1}^J \left( \mu_{i,j}^2 + \sigma_{i,j}^2 - \log(\sigma_{i,j}^2) - 1 \right)}_{\text{Regularization Loss (Analytic KL)}} 
+\right)
+$$
+
+**Where:**
+1.  **The Encoder Outputs:** $\boldsymbol{\mu}^{(i)}, \boldsymbol{\sigma}^{(i)} = \mathrm{Enc}_\phi(\mathbf{x}^{(i)})$
+2.  **The Noise:** $\boldsymbol{\epsilon}^{(i)} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$
+3.  **The Reparameterization:** $\mathbf{z}^{(i)} = \boldsymbol{\mu}^{(i)} + \boldsymbol{\sigma}^{(i)} \odot \boldsymbol{\epsilon}^{(i)}$
 
 
 
