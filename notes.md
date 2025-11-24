@@ -90,7 +90,7 @@ $
 
 Prior in variational inference is a design choice of a distribution we try to "balance" or "regularize" the Surrogate with. Posterior is a data backed ground truth. ELBO can be rewritten as balancing between these two representations.
 
-### KL Divergence
+## KL Divergence
 $$
 D_{\mathrm{KL}}\big(q(\bar z)\;||\;p(\bar z |D)\big)
 = \mathbb{E}_{\bar z\sim q(\bar z)}\left[ \log \frac{q(\bar z)}{p(\bar z\mid D)} \right]
@@ -100,7 +100,7 @@ D_{\mathrm{KL}}\big(q(\bar z)\;||\;p(\bar z |D)\big)
 dz_0\cdots dz_{d-1}.
 $$
 
-### KL Divergence between surrogate and posterior (ELBO derivation)
+## KL Divergence between surrogate and posterior (ELBO derivation)
 
 Variational Inference Surrogate Optimization (fitting some function that will model the posterior) can be written as:
 
@@ -155,7 +155,7 @@ $$
 \mathcal{L}(q) = \underbrace{\mathbb{E}_{\underline{z} \sim q(\underline{z})}[\log p(D|\underline{z})]}_{\text{Reconstruction Error}} - \underbrace{D_{KL}(q(\underline{z}) \;||\; p(\underline{z}))}_{\text{Regularization}}
 $$
 
-### Amortized ELBO
+## Amortized ELBO
 
 Amortized means we use encoder neural network to learn surrogate $q_\phi(\bm z| \bm x)$.
 
@@ -231,8 +231,44 @@ $$
 2.  **The Noise:** $\boldsymbol{\epsilon}^{(i)} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$
 3.  **The Reparameterization:** $\mathbf{z}^{(i)} = \boldsymbol{\mu}^{(i)} + \boldsymbol{\sigma}^{(i)} \odot \boldsymbol{\epsilon}^{(i)}$
 
+## VAE to Diffusion bridge (DDPM)
+
+First intuition is what the forward process does (the forward process is our "encoder"/surrogate):
+
+$$x_0 \rightarrow q(x_1|x_0) \rightarrow x_1 \rightarrow ... \rightarrow x_T$$
+
+But the encoder is just some usually constant kernel that (usually) just adds noise in a fixed way. So now instead of creating $\bm z$ in a single step, we create a chain $\bm z_1, ... \bm z_T$, but use $\bm x$ for notation. So encoder looks something like this:
+
+$$q(x_{t+1}| x_t)=\mathcal N(x_{t+1}; \sqrt{1-\beta}x_t, \beta\bm I) $$
+
+And we can again use the same reparametrization trick that we came up with for VAEs:
+
+$$\bm x_{t+1}=\sqrt{1-\beta}\bm x_t + \sqrt \beta\bm\epsilon; \bm\epsilon\sim\mathcal N(0, \bm I)$$
+
+However papers usually use the $x_{t-1}$ notation and $\beta$ is time-dependent:
+
+$$ q(x_t| x_{t-1})=\mathcal N(x_t; \sqrt{1-\beta_t}x_{t-1}, \beta_t\bm I) $$
+
+And because a sum of Gaussians is a Gaussian, we don't have to iteratively add noise, we can instead specify how many steps we want to do at once:
+
+$$ q(x_t | x_0) = \mathcal{N}(x_t; \sqrt{\bar{\alpha}_t}x_0, (1 - \bar{\alpha}_t)\mathbf{I}) $$
+
+*   $\alpha_t = 1 - \beta_t$ (How much signal we keep)
+*   $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$ (The cumulative signal kept from step 0 to $t$)
+
+Now the decoder part or reverse process is:
+
+$$x_T \rightarrow p_\theta(x_{T-1}|x_{T}) \rightarrow x_{T-1} \rightarrow ... \rightarrow x_0$$
+
+And in this diffusion model setting we only want to learn the decoder $p_\theta(x_{t-1}|x_{t})$ part of VAE setup, since the forward process is purely algebraic. A single step in this reverse process is:
+
+$$p_\theta(x_{t-1}|x_t)=$$
+
+
+
 
 
 ### Important:
+https://mbernste.github.io/posts/vae/ \
 https://yunfanj.com/blog/2021/01/11/ELBO.html \
 https://www.wpeebles.com/DiT
