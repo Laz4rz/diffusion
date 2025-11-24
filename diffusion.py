@@ -1,313 +1,412 @@
-import math
-import os
-import time
-from typing import Any
-
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
+from jaxtyping import Float, Int64, Int
+from beartype import beartype
 
-# --- Optional type/decorator deps (safe fallbacks if not installed) ---
-try:
-    from jaxtyping import Float, Int64, Int  # type: ignore
-except Exception:  # pragma: no cover
-    Float = Int64 = Int = Any  # type: ignore
-
-try:
-    from beartype import beartype  # type: ignore
-except Exception:  # pragma: no cover
-    def beartype(f):  # type: ignore
-        return f
-
-
-# --------------------------- Scheduler --------------------------- #
 class LinearNoiseScheduler(nn.Module):
     """
-    Precomputes α_t, β_t, \bar{α}_t and useful derived terms.
-    Uses a *posterior variance* for sampling (critical for stability).
+    precomputes alphas, betas and alphas cumulative product
+    reparametrization trick terms are also precomputed
+    registers precomputed values as buffers
     """
-
-    def __init__(self, num_timesteps: int = 200, beta_start: float = 1e-4, beta_end: float = 0.02):
+    def __init__(self, num_timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 0.02):
         super().__init__()
         self.num_timesteps = num_timesteps
-
+        
         beta = torch.linspace(beta_start, beta_end, num_timesteps)
-        alpha = 1.0 - beta
+        alpha = 1. - beta
         alpha_cumprod = torch.cumprod(alpha, dim=0)
-        alpha_cumprod_prev = torch.cat(
-            [torch.ones(1, dtype=alpha_cumprod.dtype), alpha_cumprod[:-1]], dim=0
-        )
 
-        # base buffers
-        self.register_buffer("beta", beta)
-        self.register_buffer("alpha", alpha)
-        self.register_buffer("alpha_cumprod", alpha_cumprod)
-        self.register_buffer("alpha_cumprod_prev", alpha_cumprod_prev)
-
-        # forward / reparameterization constants
+        # base constants
+        self.register_buffer('beta', beta)
+        self.register_buffer('alpha', alpha)
+        self.register_buffer('alpha_cumprod', alpha_cumprod)
+        
+        # x_t, reperametrization constants
         self.register_buffer("sqrt_alpha_cumprod", torch.sqrt(alpha_cumprod))
-        self.register_buffer(
-            "sqrt_one_minus_alpha_cumprod",
-            torch.sqrt((1.0 - alpha_cumprod).clamp_min(1e-20)),
-        )
+        self.register_buffer("sqrt_one_minus_alpha_cumprod", torch.sqrt(1. - alpha_cumprod))
 
-        # reverse step constants
-        self.register_buffer("sqrt_alpha_inverse", alpha.pow(-0.5))
-        self.register_buffer(
-            "beta_over_sqrt_one_minus_alpha_cumprod",
-            beta / torch.sqrt((1.0 - alpha_cumprod).clamp_min(1e-20)),
-        )
+        # x_{t-1} constants for the reverse step
+        self.register_buffer('sqrt_beta', beta.pow(0.5))
+        self.register_buffer("sqrt_alpha_inverse", torch.pow(alpha, -0.5))
+        self.register_buffer("beta_over_sqrt_one_minus_alpha_cumprod", 
+                             self.beta / self.sqrt_one_minus_alpha_cumprod)
 
-        # posterior variance (\tilde{β}_t) per Ho et al. 2020
-        posterior_variance = beta * (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod)
-        self.register_buffer("sqrt_posterior_variance", posterior_variance.clamp_min(1e-20).sqrt())
 
     @beartype
     def q_sample(
-        self,
-        x0: Float[Tensor, "b c h w"],
-        t: Int64[Tensor, "b"],
-        noise: Float[Tensor, "b c h w"] | None = None,
+        self, 
+        x0: Float[Tensor, "b c h w"], 
+        t: Int64[Tensor, "b"], 
+        noise: Float[Tensor, "b c h w"] | None = None
     ) -> Float[Tensor, "b c h w"]:
-        """Forward diffusion: x_t = √ᾱ_t x_0 + √(1-ᾱ_t) ε"""
-        if noise is None:
-            noise = torch.randn_like(x0)
+        """
+        for training we want to pass known noise so we have a ground truth to use with loss
+        """
         sac = extract(self.sqrt_alpha_cumprod, t, x0.shape)
         somac = extract(self.sqrt_one_minus_alpha_cumprod, t, x0.shape)
-        return sac * x0 + somac * noise
+
+        if noise is None:
+            noise = torch.randn_like(x0)
+
+        xt = x0 * sac + noise * somac
+
+        return xt
 
 
 @beartype
 def extract(
-    input_tensor: Float[Tensor, "timesteps"],
-    t_indices: Int[Tensor, "batch"],
-    x_shape: torch.Size | tuple,
+    input_tensor: Float[Tensor, "timesteps"], 
+    t_indices: Int[Tensor, "batch"], 
+    x_shape: torch.Size | tuple
 ) -> Float[Tensor, "batch ..."]:
-    """Gathers 1D schedule values by t and reshapes to broadcast over x."""
+    """
+    Extracts values from a 1D tensor based on indices and reshapes
+    to (batch, 1, 1, ...).
+    """
     batch_size = t_indices.shape[0]
     out = input_tensor.gather(-1, t_indices.to(input_tensor.device))
     reshape_shape = (batch_size,) + (1,) * (len(x_shape) - 1)
+    
     return out.reshape(reshape_shape)
 
 
-# --------------------------- Model --------------------------- #
-
-def timestep_embedding(t: Tensor, dim: int, max_period: int = 10_000) -> Tensor:
-    """Sinusoidal timestep embedding, shape: (B, dim)."""
-    device = t.device
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, device=device, dtype=torch.float32) / half)
-    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
-    if dim % 2 == 1:
-        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=1)
-    return emb
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, time_dim: int | None = None):
+class SimpleUnet(nn.Module):
+    def __init__(self, input_dim):
         super().__init__()
-        ng = max(1, min(8, out_ch))  # small GroupNorm works well on tiny data
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.norm1 = nn.GroupNorm(ng, out_ch)
-        self.act1 = nn.SiLU()
-
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.norm2 = nn.GroupNorm(ng, out_ch)
-        self.act2 = nn.SiLU()
-
-        self.time_proj = None
-        if time_dim is not None:
-            self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_dim, out_ch))
-
-        # simple residual for overfitting ease
-        self.residual = (in_ch == out_ch)
-
-    def forward(self, x: Tensor, t_emb: Tensor | None = None) -> Tensor:
-        h = self.conv1(x)
-        h = self.norm1(h)
-        if self.time_proj is not None and t_emb is not None:
-            h = h + self.time_proj(t_emb)[:, :, None, None]
-        h = self.act1(h)
-
-        h = self.conv2(h)
-        h = self.norm2(h)
-        h = self.act2(h)
-
-        if self.residual:
-            h = h + x
-        return h
-
-
-class TinyUNet(nn.Module):
-    def __init__(self, input_dim: int, base: int = 64, time_dim: int = 128):
-        super().__init__()
-        self.time_dim = time_dim
-        self.time_mlp = nn.Sequential(
-            nn.Linear(time_dim, 256), nn.SiLU(), nn.Linear(256, time_dim)
+        # Down: 28 -> 14 -> 7 (or 9 -> 5 -> 3)
+        self.downblock = nn.Sequential(
+            nn.Conv2d(input_dim, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
         )
-        self.inc = ConvBlock(input_dim, base, time_dim)
-        self.down1 = ConvBlock(base, base * 2, time_dim)
-        self.mid = ConvBlock(base * 2, base * 2, time_dim)
-        self.up1 = ConvBlock(base * 2, base, time_dim)
-        self.outc = nn.Conv2d(base, input_dim, kernel_size=3, padding=1)
-        nn.init.zeros_(self.outc.weight)
-        nn.init.zeros_(self.outc.bias)
 
-    def forward(self, x: Tensor, t: Tensor) -> Tensor:
-        t_emb = self.time_mlp(timestep_embedding(t, self.time_dim))
-        h = self.inc(x, t_emb)
-        h = self.down1(h, t_emb)
-        h = self.mid(h, t_emb)
-        h = self.up1(h, t_emb)
-        return self.outc(h)
+        self.time_embedder = nn.Sequential(
+            nn.Embedding(1000, 64),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+
+        # Up: 7 -> 14 -> 28 (or 3 -> 6 -> 12)
+        self.upblock = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, input_dim, 3, padding=1)
+        )
+
+    def forward(self, x, t):
+        # 1. Downsample
+        x_down = self.downblock(x) 
+        
+        # 2. Add Time Embedding
+        time_emb = self.time_embedder(t)[:, :, None, None] 
+        x_down = x_down + time_emb 
+
+        # 3. Upsample
+        output = self.upblock(x_down)
+        
+        if output.shape[-2:] != x.shape[-2:]:
+            output = F.interpolate(output, size=x.shape[-2:], mode='bilinear', align_corners=False)
+            
+        return output
 
 
-# --------------------------- Training helpers --------------------------- #
 @beartype
-def train_step(
-    model: nn.Module,
-    scheduler: LinearNoiseScheduler,
-    optimizer: torch.optim.Optimizer,
-    x0_batch: Float[Tensor, "b c h w"],
-) -> float:
+def train_batch(
+    model: nn.Module, 
+    scheduler: LinearNoiseScheduler, 
+    optimizer: torch.optim.Optimizer, 
+    x0: Float[Tensor, "b c h w"]
+) -> Float[Tensor, ""]: # Returns a scalar tensor (loss)
+    """
+    Performs one step of training: Corrupts image, predicts noise, calculates gradient.
+    """
     model.train()
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad()
 
-    b = x0_batch.shape[0]
-    t = torch.randint(0, scheduler.num_timesteps, (b,), device=x0_batch.device)
-    noise = torch.randn_like(x0_batch)
-    xt = scheduler.q_sample(x0_batch, t, noise)
-
+    batch_size = x0.shape[0]
+    
+    # 1. Sample random timesteps t
+    t = torch.randint(low=0, high=scheduler.num_timesteps, size=(batch_size,), device=x0.device)
+    
+    # 2. Create the noise (epsilon)
+    noise = torch.randn_like(x0)
+    
+    # 3. Create the noisy image (x_t)
+    xt = scheduler.q_sample(x0, t, noise)
+    
+    # 4. Predict the noise
     noise_pred = model(xt, t)
+    
+    # 5. Calculate Loss and Backprop
     loss = F.mse_loss(noise_pred, noise)
-
+    
     loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    return float(loss.detach().item())
+    
+    return loss
 
 
 @torch.no_grad()
 @beartype
 def sample(
-    model: nn.Module,
-    scheduler: LinearNoiseScheduler,
-    image_shape: tuple[int, ...],
-    device: torch.device | str,
+    model: nn.Module, 
+    scheduler: LinearNoiseScheduler, 
+    image_shape: tuple[int, ...], 
+    device: torch.device | str
 ) -> Float[Tensor, "b c h w"]:
-    model.eval()
+    """
+    Generates images from pure noise by iterating backwards from T to 0.
+    """
+    # 1. Start with pure noise
     x = torch.randn(image_shape, device=device)
+    
+    # 2. Iterate backwards from T-1 down to 0
     for i in reversed(range(scheduler.num_timesteps)):
-        t = torch.full((x.shape[0],), i, device=device, dtype=torch.long)
-
+        t = torch.full((x.shape[0], ), i, device=device, dtype=torch.long)
+        
+        # Predict noise
         noise_pred = model(x, t)
-        sqrt_alpha_inv = extract(scheduler.sqrt_alpha_inverse, t, x.shape)
-        coeff = extract(scheduler.beta_over_sqrt_one_minus_alpha_cumprod, t, x.shape)
-        mean = sqrt_alpha_inv * (x - coeff * noise_pred)
 
+        # Get the pre-calculated coefficients for this timestep
+        sqrt_alpha_inv = extract(scheduler.sqrt_alpha_inverse, t, x.shape)
+        beta_over_sigma = extract(scheduler.beta_over_sqrt_one_minus_alpha_cumprod, t, x.shape)
+        sqrt_beta = extract(scheduler.sqrt_beta, t, x.shape) # This is sigma_t
+
+        # Calculate the Mean (mu_theta)
+        # Formula: 1/sqrt(alpha) * (x - beta/sqrt(1-alpha_bar) * eps_theta)
+        mean = sqrt_alpha_inv * (x - beta_over_sigma * noise_pred)
+
+        # Update x to x_{t-1}
+        # If i > 0, add noise. If i == 0, just return the mean.
         if i > 0:
             noise = torch.randn_like(x)
-            sqrt_post = extract(scheduler.sqrt_posterior_variance, t, x.shape)
-            x = mean + sqrt_post * noise
+            x = mean + sqrt_beta * noise
         else:
             x = mean
+
     return x
 
-
-# --------------------------- Main: single-sample overfit --------------------------- #
 if __name__ == "__main__":
+    import os
+    import time
+    from torch.utils.data import DataLoader, TensorDataset
     from torchvision import datasets, transforms
-    from torchvision.utils import make_grid, save_image
+    import shutil
+    import matplotlib.pyplot as plt
 
-    # 0) Repro & device
-    torch.manual_seed(0)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available() else (
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-    )
-    print(f"Using device: {device}")
-
-    # 1) Load *one* MNIST example and normalize to [-1, 1]
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda t: (t * 2.0) - 1.0),
-    ])
-    train_ds = datasets.MNIST("./data", train=True, download=True, transform=transform)
-
-    # Pick a specific digit to make visual inspection easy (e.g., digit 1)
-    KEEP_DIGIT = 1
-    if KEEP_DIGIT is not None:
-        idxs = (train_ds.targets == KEEP_DIGIT).nonzero(as_tuple=True)[0]
-        idx = int(idxs[0].item())
-    else:
-        idx = 0
-
-    x0_single, _ = train_ds[idx]  # (1, 28, 28) in [-1,1]
-    x0_single = x0_single.unsqueeze(0)  # (1, 1, 28, 28)
-    print(f"Selected sample index {idx} with shape {tuple(x0_single.shape)}")
-
-    # 2) Repeat the same sample to form a small batch (helps optimization)
-    BATCH = 32
-    x0_batch = x0_single.repeat(BATCH, 1, 1, 1).to(device)
-
-    # 3) Model & scheduler intentionally sized for *overfitting*
-    scheduler = LinearNoiseScheduler(num_timesteps=200).to(device)
-    model = TinyUNet(input_dim=1, base=64, time_dim=128).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    # 4) Train for a fixed number of steps (or early stop if it crushes the loss)
+    # Create results folder
+    if os.path.exists("results/ddpm"):
+        shutil.rmtree("results/ddpm")
     os.makedirs("results/ddpm", exist_ok=True)
 
-    steps = 5000
-    ema = 0.0
-    alpha = 0.98  # for a smoothed loss display
-    t0 = time.perf_counter()
+    # 1. Setup Data with [-1, 1] Normalization
+    def mnist_loader(batch_size=64, keep_digit=0, max_examples=None):
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Lambda(lambda t: (t * 2) - 1) 
+        ])
+        
+        train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+        test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
+        
+        # --- 1. FILTER CLASS (Train & Test) ---
+        if keep_digit is not None:
+            # Filter Train
+            train_idx = train_dataset.targets == keep_digit
+            train_dataset.data = train_dataset.data[train_idx]
+            train_dataset.targets = train_dataset.targets[train_idx]
+            
+            # Filter Test
+            test_idx = test_dataset.targets == keep_digit
+            test_dataset.data = test_dataset.data[test_idx]
+            test_dataset.targets = test_dataset.targets[test_idx]
+        
+        # --- 2. LIMIT EXAMPLES (Train only) ---
+        # We usually limit training data to test few-shot capabilities, 
+        # but we keep the full test set to see if it generalizes.
+        if max_examples is not None:
+            limit = min(max_examples, len(train_dataset.data))
+            train_dataset.data = train_dataset.data[:limit]
+            train_dataset.targets = train_dataset.targets[:limit]
+            print(f"Limiting training set to {limit} examples.")
 
-    for step in range(1, steps + 1):
-        loss_val = train_step(model, scheduler, optimizer, x0_batch)
-        ema = alpha * ema + (1 - alpha) * loss_val if step > 1 else loss_val
+        # --- 3. REPEAT TO FILL BATCH (Train only) ---
+        # If we have fewer training samples than batch_size, repeat them
+        current_len = len(train_dataset.data)
+        if current_len < batch_size and current_len > 0:
+            import math
+            repeats = math.ceil(batch_size / current_len)
+            print(f"Train set size ({current_len}) < Batch Size ({batch_size}). Repeating data {repeats} times.")
+            
+            train_dataset.data = train_dataset.data.repeat(repeats, 1, 1)
+            train_dataset.targets = train_dataset.targets.repeat(repeats)
 
-        if step % 100 == 0 or step == 1:
-            elapsed = time.perf_counter() - t0
-            print(f"step {step:5d} | loss {loss_val:.6f} | ema {ema:.6f} | {elapsed:.1f}s")
+        print(f"Final Stats | Digit: {keep_digit} | Train Size: {len(train_dataset)} | Test Size: {len(test_dataset)}")
+        
+        # Drop_last=True for train to avoid unstable partial batches
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        
+        # Shuffle=False and drop_last=False for test
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+        
+        return train_loader, test_loader
+    
+    def synthetic_cross_loader(batch_size=64, num_samples=1000):
+        """
+        Returns a dataloader that yields a synthetic 9x9 image 
+        with a cross pattern, repeated 'num_samples' times.
+        Range is [-1, 1] for diffusion compatibility.
+        """
+        # 1. Create the canvas (1 channel, 9x9) with background -1
+        # Shape: [1, 9, 9]
+        img = torch.full((1, 9, 9), -1.0)
+        
+        # 2. Draw the cross with foreground 1
+        # For a 9x9 grid, the center index is 4
+        img[:, 4, :] = 1.0  # Horizontal line (Middle Row)
+        img[:, :, 4] = 1.0  # Vertical line (Middle Column)
+        
+        # 3. Repeat this single example to create a full dataset
+        # Shape becomes: [num_samples, 1, 9, 9]
+        data = img.repeat(num_samples, 1, 1, 1)
+        
+        # 4. Create dummy labels (just 0s)
+        targets = torch.zeros(num_samples, dtype=torch.long)
+        
+        # 5. Create Dataset and Loader
+        dataset = TensorDataset(data, targets)
+        
+        # shuffle=True is technically irrelevant for identical data, 
+        # but good practice to keep the API consistent.
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        return loader
 
-        # quick qualitative check: sample occasionally
-        if step % 1000 == 0:
+
+    # 2. Setup Device & Seed
+    torch.manual_seed(0)
+    train_loader, test_loader = mnist_loader(batch_size=512, keep_digit=1, max_examples=1)
+    device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+    synchronize = torch.mps.synchronize if torch.backends.mps.is_available() else (torch.cuda.synchronize if torch.cuda.is_available() else lambda: None)
+    train_loader = synthetic_cross_loader(batch_size=512, num_samples=1024)
+    print(f"Using device: {device}")
+
+    # 3. Instantiate Model & Scheduler
+    # Scheduler buffers move to device automatically when .to(device) is called
+    scheduler = LinearNoiseScheduler(num_timesteps=100).to(device)
+    model = SimpleUnet(input_dim=1).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    num_epochs = 50000
+    
+    sample_shape = next(iter(train_loader))[0].shape
+
+    # 4. Training Loop
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0
+        start_time = time.perf_counter()
+        
+        for x, _ in train_loader:
+            x = x.to(device)
+            
+            # We use the train_batch helper we defined earlier
+            # It handles sampling t, adding noise, predicting, and backprop
+            loss_val = train_batch(model, scheduler, optimizer, x)
+            
+            # train_batch returns a detached tensor or float, so we just add it
+            train_loss += loss_val
+
+        synchronize()
+        if (epoch + 1) % 500 == 0:
+            print(f"Epoch {epoch+1}, Loss: {train_loss/len(train_loader):.5f}, Time: {time.perf_counter() - start_time:.2f}s")
+        
+        if (epoch + 1) % 2000 == 0:
+            # 5. Evaluation & Sampling
+            model.eval()
+            test_loss = 0
+            
+            # Validation Loss (How well do we predict noise on unseen data?)
             with torch.no_grad():
-                x_samples = sample(model, scheduler, (16, 1, 28, 28), device)
-                x_vis = ((x_samples + 1.0) / 2.0).clamp(0, 1)
-                grid = make_grid(x_vis, nrow=8)
-                save_path = f"results/ddpm/overfit_samples_step_{step}.png"
-                save_image(grid, save_path)
-                print(f"Saved {save_path}")
+                for x, _ in test_loader:
+                    x = x.to(device)
+                    # Replicate train logic but without backprop
+                    t = torch.randint(0, scheduler.num_timesteps, (x.shape[0],), device=device)
+                    noise = torch.randn_like(x)
+                    xt = scheduler.q_sample(x, t, noise)
+                    noise_pred = model(xt, t)
+                    loss = F.mse_loss(noise_pred, noise)
+                    test_loss += loss.item()
 
-        # simple early stop if it's totally overfit
-        if ema < 1e-4 and step > 1000:
-            print("Early stopping: loss sufficiently low.")
-            break
+            # Sampling with Snapshots
+            # We will generate 4 samples and visualize 6 steps for each
+            n_vis_samples = 4
+            # Define specific timesteps we want to see (e.g., 999, 800, 600, 400, 200, 0)
+            snapshot_steps = torch.linspace(
+                scheduler.num_timesteps - 1, 0, steps=6, dtype=torch.long
+            ).tolist()
+            
+            # 1. Start with pure noise
+            x = torch.randn((n_vis_samples, sample_shape[1], sample_shape[2], sample_shape[3]), device=device)
+            history = [] # To store the snapshots
 
-    # 5) Final sampling & save
-    with torch.no_grad():
-        x_samples = sample(model, scheduler, (16, 1, 28, 28), device)
-        x_vis = ((x_samples + 1.0) / 2.0).clamp(0, 1)
-        grid = make_grid(x_vis, nrow=8)
-        save_path = "results/ddpm/overfit_final.png"
-        save_image(grid, save_path)
-        print(f"Saved final samples to {save_path}")
+            # 2. Manual Sampling Loop to capture intermediates
+            for i in reversed(range(scheduler.num_timesteps)):
+                t = torch.full((n_vis_samples,), i, device=device, dtype=torch.long)
+                
+                # Predict noise
+                noise_pred = model(x, t)
 
-    # 6) Quick quantitative sanity check on the *training* example
-    with torch.no_grad():
-        model.eval()
-        b = 256
-        t = torch.randint(0, scheduler.num_timesteps, (b,), device=device)
-        x0_eval = x0_single.to(device).repeat(b, 1, 1, 1)
-        noise = torch.randn_like(x0_eval)
-        xt = scheduler.q_sample(x0_eval, t, noise)
-        eps = model(xt, t)
-        mse = F.mse_loss(eps, noise).item()
-        print(f"Noise-pred MSE on training sample (random t): {mse:.6f}")
+                # Get coefficients (Reusing your extract logic)
+                sqrt_alpha_inv = extract(scheduler.sqrt_alpha_inverse, t, x.shape)
+                beta_over_sigma = extract(scheduler.beta_over_sqrt_one_minus_alpha_cumprod, t, x.shape)
+                sqrt_beta = extract(scheduler.sqrt_beta, t, x.shape)
+
+                # Calculate the Mean
+                mean = sqrt_alpha_inv * (x - beta_over_sigma * noise_pred)
+
+                # Update x
+                if i > 0:
+                    noise = torch.randn_like(x)
+                    x = mean + sqrt_beta * noise
+                else:
+                    x = mean
+                
+                # Save snapshot if this step is in our list
+                if i in snapshot_steps:
+                    history.append(x.detach().cpu())
+
+            # 3. Visualization
+            # Rows = Different Samples, Cols = Time Steps
+            fig, axs = plt.subplots(n_vis_samples, len(snapshot_steps), figsize=(12, 6))
+            
+            # history is currently [t=999, t=800, ..., t=0]
+            
+            for row in range(n_vis_samples):
+                for col, step_idx in enumerate(snapshot_steps):
+                    # Get the specific image tensor
+                    img_tensor = history[col][row] 
+                    
+                    # Inverse Transform: [-1, 1] -> [0, 1]
+                    img_disp = (img_tensor + 1) / 2
+                    img_disp = img_disp.clamp(0, 1).squeeze(0)
+
+                    axs[row, col].imshow(img_disp, cmap='gray')
+                    
+                    # Only set labels on the top row
+                    if row == 0:
+                        axs[row, col].set_title(f"t={step_idx}")
+                    axs[row, col].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(f"results/ddpm/ddpm_epoch_{epoch+1}.png")
+            plt.close(fig)
+
+            print(f"Test Loss: {test_loss/len(test_loader):.5f}")
