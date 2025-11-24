@@ -122,10 +122,13 @@ def train_batch(
     model: nn.Module, 
     scheduler: LinearNoiseScheduler, 
     optimizer: torch.optim.Optimizer, 
-    x0: Float[Tensor, "b c h w"]
-) -> Float[Tensor, ""]: # Returns a scalar tensor (loss)
+    x0: Float[Tensor, "b c h w"],
+    use_weighted_loss: bool = True
+) -> Float[Tensor, ""]: 
     """
-    Performs one step of training: Corrupts image, predicts noise, calculates gradient.
+    Performs one step of training. 
+    If use_weighted_loss is True, pixels with values > -0.5 (signal) 
+    are weighted 10x more than background pixels.
     """
     model.train()
     optimizer.zero_grad()
@@ -144,8 +147,20 @@ def train_batch(
     # 4. Predict the noise
     noise_pred = model(xt, t)
     
-    # 5. Calculate Loss and Backprop
-    loss = F.mse_loss(noise_pred, noise)
+    # 5. Calculate Loss
+    if use_weighted_loss:
+        # Calculate per-pixel squared error
+        loss_unreduced = F.mse_loss(noise_pred, noise, reduction='none')
+        
+        # Define Weights: Background (-1) gets 1.0, Signal (>-0.5) gets 10.0
+        weights = torch.ones_like(x0)
+        weights[x0 > -0.5] = 10.0
+        
+        # Apply weights and reduce
+        loss = (loss_unreduced * weights).mean()
+    else:
+        # Standard MSE
+        loss = F.mse_loss(noise_pred, noise)
     
     loss.backward()
     optimizer.step()
@@ -265,16 +280,17 @@ if __name__ == "__main__":
         Range is [-1, 1] for diffusion compatibility.
         """
         # 1. Create the canvas (1 channel, 9x9) with background -1
-        # Shape: [1, 9, 9]
-        img = torch.full((1, 9, 9), -1.0)
+        # Shape: [1, 28, 28]
+        size = 15
+        img = torch.full((1, size, size), -1.0)
         
         # 2. Draw the cross with foreground 1
-        # For a 9x9 grid, the center index is 4
-        img[:, 4, :] = 1.0  # Horizontal line (Middle Row)
-        img[:, :, 4] = 1.0  # Vertical line (Middle Column)
+        # For a 28x28 grid, the center index is 14
+        img[:, size // 2, :] = 1.0  # Horizontal line (Middle Row)
+        img[:, :, size // 2] = 1.0  # Vertical line (Middle Column)
         
         # 3. Repeat this single example to create a full dataset
-        # Shape becomes: [num_samples, 1, 9, 9]
+        # Shape becomes: [num_samples, 1, 28, 28]
         data = img.repeat(num_samples, 1, 1, 1)
         
         # 4. Create dummy labels (just 0s)
@@ -296,6 +312,7 @@ if __name__ == "__main__":
     device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     synchronize = torch.mps.synchronize if torch.backends.mps.is_available() else (torch.cuda.synchronize if torch.cuda.is_available() else lambda: None)
     train_loader = synthetic_cross_loader(batch_size=512, num_samples=1024)
+
     print(f"Using device: {device}")
 
     # 3. Instantiate Model & Scheduler
@@ -303,6 +320,25 @@ if __name__ == "__main__":
     scheduler = LinearNoiseScheduler(num_timesteps=100).to(device)
     model = SimpleUnet(input_dim=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    # Visualize Forward Process Overview
+    with torch.no_grad():
+        samp = next(iter(train_loader))[0][:1].to(device)
+        noise_seed = torch.randn_like(samp)
+        timeline = torch.linspace(0, scheduler.num_timesteps - 1, steps=10).long()
+        frames = []
+        for step in timeline:
+            t_step = torch.full((1,), step.item(), device=device, dtype=torch.long)
+            frames.append(scheduler.q_sample(samp, t_step, noise_seed).cpu())
+        fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+        for ax, frame, step in zip(axes.flatten(), frames, timeline.tolist()):
+            img = (frame[0] + 1) / 2
+            ax.imshow(img.squeeze().clamp(0, 1), cmap="gray")
+            ax.set_title(f"t={step}")
+            ax.axis("off")
+        plt.tight_layout()
+        plt.savefig("results/ddpm/forward_overview.png")
+        plt.close(fig)
 
     num_epochs = 50000
     
@@ -328,7 +364,7 @@ if __name__ == "__main__":
         if (epoch + 1) % 500 == 0:
             print(f"Epoch {epoch+1}, Loss: {train_loss/len(train_loader):.5f}, Time: {time.perf_counter() - start_time:.2f}s")
         
-        if (epoch + 1) % 2000 == 0:
+        if (epoch + 1) % 2000 == 0 or epoch == num_epochs - 1 or epoch == 0:
             # 5. Evaluation & Sampling
             model.eval()
             test_loss = 0
