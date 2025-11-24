@@ -262,7 +262,7 @@ $$x_T \rightarrow p_\theta(x_{T-1}|x_{T}) \rightarrow x_{T-1} \rightarrow ... \r
 
 And in this diffusion model setting we only want to learn the decoder $p_\theta(x_{t-1}|x_{t})$ part of VAE setup, since the forward process is purely algebraic. A single step in this reverse process is:
 
-$$p_\theta(x_{t-1}|x_t)=$$
+<!-- $$p_\theta(x_{t-1}|x_t)=$$ -->
 
 
 
