@@ -71,30 +71,57 @@ def extract(
     
     return out.reshape(reshape_shape)
 
+class SelfAttention(nn.Module):
+    def __init__(self, channels): # Removed 'size' argument
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Height, Width)
+        b, c, h, w = x.shape
+        
+        # Flatten spatial dimensions: (B, C, H, W) -> (B, C, H*W) -> (B, H*W, C)
+        x_flat = x.view(b, c, -1).swapaxes(1, 2)
+        
+        x_ln = self.ln(x_flat)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x_flat
+        attention_value = self.ff_self(attention_value) + attention_value
+        
+        # Reshape back: (B, H*W, C) -> (B, C, H*W) -> (B, C, H, W)
+        return attention_value.swapaxes(2, 1).view(b, c, h, w)
 
 class SimpleUnet(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, use_attention=True):
         super().__init__()
+        self.use_attention = use_attention
         
         # --- ENCODER (Down) ---
-        
-        # Layer 1: Input -> 32
         self.down1 = nn.Sequential(
             nn.Conv2d(input_dim, 32, 3, padding=1),
             nn.GELU()
         )
-        
-        # Layer 2: 32 -> 64 (Downsample)
         self.down2 = nn.Sequential(
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
             nn.GELU()
         )
-        
-        # Layer 3: 64 -> 64 (Downsample)
         self.down3 = nn.Sequential(
             nn.Conv2d(64, 64, 3, stride=2, padding=1),
             nn.GELU()
         )
+
+        # --- BOTTLENECK ATTENTION ---
+        if self.use_attention:
+            # REMOVED size=7. It now adapts to 4x4, 7x7, or whatever comes in.
+            self.attn = SelfAttention(channels=64) 
 
         # --- TIME EMBEDDING ---
         self.time_embedder = nn.Sequential(
@@ -104,69 +131,52 @@ class SimpleUnet(nn.Module):
         )
 
         # --- DECODER (Up) ---
-        # Channels are adjusted to handle concatenation
-        
-        # Up 1: Input 64 (from down3) -> Output 32
-        # We will concatenate this with down2 (64 ch). Total next input = 32 + 64 = 96
         self.up1 = nn.Sequential(
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
             nn.GELU()
         )
-        
-        # Up 2: Input 96 -> Output 16
-        # We will concatenate this with down1 (32 ch). Total next input = 16 + 32 = 48
         self.up2 = nn.Sequential(
             nn.ConvTranspose2d(96, 16, 4, stride=2, padding=1),
             nn.GELU()
         )
-        
-        # Up 3: Input 48 -> Output input_dim
         self.up3 = nn.Conv2d(48, input_dim, 3, padding=1)
 
     def forward(self, x, t):
-        # --- DOWN PASS ---
-        x1 = self.down1(x)   # Save x1 (32 ch, Full Size)
-        x2 = self.down2(x1)  # Save x2 (64 ch, Half Size)
-        x3 = self.down3(x2)  # Bottom  (64 ch, Quarter Size)
+        # ... (Your forward logic remains exactly the same) ...
+        x1 = self.down1(x)
+        x2 = self.down2(x1)
+        x3 = self.down3(x2)
         
-        # --- TIME INJECTION ---
         time_emb = self.time_embedder(t)[:, :, None, None] 
         x3 = x3 + time_emb 
 
-        # --- UP PASS ---
-        
-        # Block 1
+        if self.use_attention:
+            x3 = self.attn(x3)
+
         x_up = self.up1(x3)
-        # Resize to match skip connection (Fixes 9x9 vs 12x12 issue)
         if x_up.shape[-2:] != x2.shape[-2:]:
             x_up = F.interpolate(x_up, size=x2.shape[-2:], mode='bilinear', align_corners=False)
-        # Concatenate: (Batch, 32+64, H, W)
         x_up = torch.cat([x_up, x2], dim=1) 
 
-        # Block 2
         x_up = self.up2(x_up)
-        # Resize to match skip connection
         if x_up.shape[-2:] != x1.shape[-2:]:
             x_up = F.interpolate(x_up, size=x1.shape[-2:], mode='bilinear', align_corners=False)
-        # Concatenate: (Batch, 16+32, H, W)
         x_up = torch.cat([x_up, x1], dim=1) 
 
-        # Final Layer
         return self.up3(x_up)
 
 
 @beartype
 def train_batch(
-    model: nn.Module, 
-    scheduler: LinearNoiseScheduler, 
-    optimizer: torch.optim.Optimizer, 
-    x0: Float[Tensor, "b c h w"],
-    use_weighted_loss: bool = True
-) -> Float[Tensor, ""]: 
+    model, 
+    scheduler, 
+    optimizer, 
+    x0, 
+    use_weighted_loss=True
+): 
     """
-    Performs one step of training. 
-    If use_weighted_loss is True, pixels with values > -0.5 (signal) 
-    are weighted 10x more than background pixels.
+    Performs one full training step (Forward -> Loss -> Backward -> Clip -> Step).
+    Returns a dictionary of metrics (detached tensors) for logging.
     """
     model.train()
     optimizer.zero_grad()
@@ -197,13 +207,24 @@ def train_batch(
         # Apply weights and reduce
         loss = (loss_unreduced * weights).mean()
     else:
-        # Standard MSE
         loss = F.mse_loss(noise_pred, noise)
     
+    # 6. Backward
     loss.backward()
+    
+    # 7. Clip Gradients & Get Norm (Crucial for stability)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    
+    # 8. Step
     optimizer.step()
     
-    return loss
+    # 9. Return Metrics (Detached to avoid memory leaks/graph retention)
+    return {
+        "loss": loss.detach(),
+        "grad_norm": grad_norm.detach(),
+        "pred_mean": noise_pred.detach().mean(),
+        "pred_std": noise_pred.detach().std()
+    }
 
 
 @torch.no_grad()
@@ -249,170 +270,248 @@ def sample(
 if __name__ == "__main__":
     import os
     import time
-    from torch.utils.data import DataLoader, TensorDataset
-    from torchvision import datasets, transforms
     import shutil
     import matplotlib.pyplot as plt
-
-    # Create results folder
-    if os.path.exists("results/ddpm"):
-        shutil.rmtree("results/ddpm")
-    os.makedirs("results/ddpm", exist_ok=True)
-
-    # 1. Setup Data with [-1, 1] Normalization
-    def mnist_loader(batch_size=64, keep_digit=0, max_examples=None):
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(lambda t: (t * 2) - 1) 
-        ])
-        
-        train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-        test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
-        
-        # --- 1. FILTER CLASS (Train & Test) ---
-        if keep_digit is not None:
-            # Filter Train
-            train_idx = train_dataset.targets == keep_digit
-            train_dataset.data = train_dataset.data[train_idx]
-            train_dataset.targets = train_dataset.targets[train_idx]
-            
-            # Filter Test
-            test_idx = test_dataset.targets == keep_digit
-            test_dataset.data = test_dataset.data[test_idx]
-            test_dataset.targets = test_dataset.targets[test_idx]
-        
-        # --- 2. LIMIT EXAMPLES (Train only) ---
-        # We usually limit training data to test few-shot capabilities, 
-        # but we keep the full test set to see if it generalizes.
-        if max_examples is not None:
-            limit = min(max_examples, len(train_dataset.data))
-            train_dataset.data = train_dataset.data[:limit]
-            train_dataset.targets = train_dataset.targets[:limit]
-            print(f"Limiting training set to {limit} examples.")
-
-        # --- 3. REPEAT TO FILL BATCH (Train only) ---
-        # If we have fewer training samples than batch_size, repeat them
-        current_len = len(train_dataset.data)
-        if current_len < batch_size and current_len > 0:
-            import math
-            repeats = math.ceil(batch_size / current_len)
-            print(f"Train set size ({current_len}) < Batch Size ({batch_size}). Repeating data {repeats} times.")
-            
-            train_dataset.data = train_dataset.data.repeat(repeats, 1, 1)
-            train_dataset.targets = train_dataset.targets.repeat(repeats)
-
-        print(f"Final Stats | Digit: {keep_digit} | Train Size: {len(train_dataset)} | Test Size: {len(test_dataset)}")
-        
-        # Drop_last=True for train to avoid unstable partial batches
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-        
-        # Shuffle=False and drop_last=False for test
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-        
-        return train_loader, test_loader
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, TensorDataset
     
-    def synthetic_cross_loader(batch_size=64, num_samples=1000):
+    # --------------------------------------------------------------------------
+    # 1. Data Loader (Optimized for Device)
+    # --------------------------------------------------------------------------
+    
+    def synthetic_shapes_loader(batch_size, num_samples, shape_type="mix", img_size=28, device='cpu'):
         """
-        Returns a dataloader that yields a synthetic 9x9 image 
-        with a cross pattern, repeated 'num_samples' times.
-        Range is [-1, 1] for diffusion compatibility.
+        Generates synthetic data and moves it to the specific device immediately.
         """
-        # 1. Create the canvas (1 channel, 9x9) with background -1
-        # Shape: [1, 28, 28]
-        size = 25
-        img = torch.full((1, size, size), -1.0)
         
-        # 2. Draw the cross with foreground 1
-        # For a 28x28 grid, the center index is 14
-        img[:, size // 2, :] = 1.0  # Horizontal line (Middle Row)
-        img[:, :, size // 2] = 1.0  # Vertical line (Middle Column)
+        def get_single_shape(name):
+            # Create on CPU first to use efficient drawing logic
+            img = torch.full((1, img_size, img_size), -1.0)
+            center = img_size // 2
+            
+            if name == "cross":
+                img[:, center, :] = 1.0
+                img[:, :, center] = 1.0
+                
+            elif name == "square":
+                r = img_size // 4
+                img[:, center-r:center+r, center-r:center+r] = 1.0
+                
+            elif name == "circle":
+                y, x = torch.meshgrid(torch.arange(img_size), torch.arange(img_size), indexing='ij')
+                radius = img_size // 4
+                mask = ((x - center)**2 + (y - center)**2) <= radius**2
+                img[:, mask] = 1.0
+            
+            return img
+
+        # 1. Generate Data (on CPU)
+        if shape_type == "mix":
+            shapes = ["cross", "square", "circle"]
+            chunk_size = num_samples // len(shapes)
+            data_chunks = []
+            for s in shapes:
+                base_img = get_single_shape(s)
+                data_chunks.append(base_img.repeat(chunk_size, 1, 1, 1))
+            
+            remainder = num_samples - (chunk_size * len(shapes))
+            if remainder > 0:
+                data_chunks.append(get_single_shape(shapes[0]).repeat(remainder, 1, 1, 1))
+            data = torch.cat(data_chunks, dim=0)
+        else:
+            base_img = get_single_shape(shape_type)
+            data = base_img.repeat(num_samples, 1, 1, 1)
         
-        # 3. Repeat this single example to create a full dataset
-        # Shape becomes: [num_samples, 1, 28, 28]
-        data = img.repeat(num_samples, 1, 1, 1)
+        # 2. Move to Device IMMEDIATELY (The Optimization)
+        print(f"Moving {len(data)} samples to {device}...")
+        data = data.to(device)
+        targets = torch.zeros(len(data), dtype=torch.long).to(device)
         
-        # 4. Create dummy labels (just 0s)
-        targets = torch.zeros(num_samples, dtype=torch.long)
-        
-        # 5. Create Dataset and Loader
+        # 3. Create Dataset/Loader
+        # Note: num_workers must be 0 when using CUDA tensors in a Dataset
         dataset = TensorDataset(data, targets)
-        
-        # shuffle=True is technically irrelevant for identical data, 
-        # but good practice to keep the API consistent.
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         return loader
 
+    # --------------------------------------------------------------------------
+    # 2. Visualization Helpers
+    # --------------------------------------------------------------------------
 
-    # 2. Setup Device & Seed
-    torch.manual_seed(0)
-    train_loader, test_loader = mnist_loader(batch_size=512, keep_digit=1, max_examples=1)
-    device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
-    synchronize = torch.mps.synchronize if torch.backends.mps.is_available() else (torch.cuda.synchronize if torch.cuda.is_available() else lambda: None)
-    train_loader = synthetic_cross_loader(batch_size=512, num_samples=1024)
-    test_loader = synthetic_cross_loader(batch_size=1, num_samples=1)
+    def visualize_forward_process(scheduler, sample_img, device, save_path):
+        with torch.no_grad():
+            # sample_img is already on device, but .to(device) is safe to call again
+            sample_img = sample_img.to(device)
+            noise_seed = torch.randn_like(sample_img)
+            timeline = torch.linspace(0, scheduler.num_timesteps - 1, steps=10).long()
+            frames = []
+            
+            for step in timeline:
+                t_step = torch.full((1,), step.item(), device=device, dtype=torch.long)
+                frames.append(scheduler.q_sample(sample_img, t_step, noise_seed).cpu())
+            
+            fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+            for ax, frame, step in zip(axes.flatten(), frames, timeline.tolist()):
+                img = (frame[0] + 1) / 2
+                ax.imshow(img.squeeze().clamp(0, 1), cmap="gray")
+                ax.set_title(f"t={step}")
+                ax.axis("off")
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close(fig)
 
-    print(f"Using device: {device}")
+    def sample_and_save_snapshot(model, scheduler, sample_shape, device, epoch, save_path):
+        n_vis_samples = 4
+        snapshot_steps = torch.linspace(scheduler.num_timesteps - 1, 0, steps=6, dtype=torch.long).tolist()
+        
+        x = torch.randn((n_vis_samples, *sample_shape), device=device)
+        history = [] 
 
-    # 3. Instantiate Model & Scheduler
-    # Scheduler buffers move to device automatically when .to(device) is called
-    scheduler = LinearNoiseScheduler(num_timesteps=250).to(device)
-    model = SimpleUnet(input_dim=1).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+        for i in reversed(range(scheduler.num_timesteps)):
+            t = torch.full((n_vis_samples,), i, device=device, dtype=torch.long)
+            noise_pred = model(x, t)
 
-    # Visualize Forward Process Overview
-    with torch.no_grad():
-        samp = next(iter(train_loader))[0][:1].to(device)
-        noise_seed = torch.randn_like(samp)
-        timeline = torch.linspace(0, scheduler.num_timesteps - 1, steps=10).long()
-        frames = []
-        for step in timeline:
-            t_step = torch.full((1,), step.item(), device=device, dtype=torch.long)
-            frames.append(scheduler.q_sample(samp, t_step, noise_seed).cpu())
-        fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-        for ax, frame, step in zip(axes.flatten(), frames, timeline.tolist()):
-            img = (frame[0] + 1) / 2
-            ax.imshow(img.squeeze().clamp(0, 1), cmap="gray")
-            ax.set_title(f"t={step}")
-            ax.axis("off")
+            sqrt_alpha_inv = extract(scheduler.sqrt_alpha_inverse, t, x.shape)
+            beta_over_sigma = extract(scheduler.beta_over_sqrt_one_minus_alpha_cumprod, t, x.shape)
+            sqrt_beta = extract(scheduler.sqrt_beta, t, x.shape)
+            mean = sqrt_alpha_inv * (x - beta_over_sigma * noise_pred)
+
+            if i > 0:
+                noise = torch.randn_like(x)
+                x = mean + sqrt_beta * noise
+            else:
+                x = mean
+            
+            if i in snapshot_steps:
+                history.append(x.detach().cpu())
+
+        fig, axs = plt.subplots(n_vis_samples, len(snapshot_steps), figsize=(12, 6))
+        for row in range(n_vis_samples):
+            for col, step_idx in enumerate(snapshot_steps):
+                img_tensor = history[col][row] 
+                img_disp = (img_tensor + 1) / 2
+                img_disp = img_disp.clamp(0, 1).squeeze(0)
+                axs[row, col].imshow(img_disp, cmap='gray')
+                if row == 0: axs[row, col].set_title(f"t={step_idx}")
+                axs[row, col].axis('off')
         plt.tight_layout()
-        plt.savefig("results/ddpm/forward_overview.png")
+        plt.savefig(save_path)
         plt.close(fig)
 
-    num_epochs = 50000
-    
-    sample_shape = next(iter(train_loader))[0].shape
+    def get_grad_norm(model):
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
 
+    # --------------------------------------------------------------------------
+    # 3. Main Execution
+    # --------------------------------------------------------------------------
+    
+    # Configuration
+    NUM_EPOCHS = 50000
+    BATCH_SIZE = 64
+    LR = 3e-4
+    LOG_INTERVAL = 25
+    EVAL_INTERVAL = 25
+    
+    # Setup
+    if os.path.exists("results/ddpm"):
+        shutil.rmtree("results/ddpm")
+    os.makedirs("results/ddpm", exist_ok=True)
+    
+    torch.manual_seed(0)
+    device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+    synchronize = torch.mps.synchronize if torch.backends.mps.is_available() else (torch.cuda.synchronize if torch.cuda.is_available() else lambda: None)
+    print(f"Using device: {device}")
+
+    # Dataset Selection - NOW PASSING DEVICE
+    train_loader = synthetic_shapes_loader(
+        batch_size=BATCH_SIZE, 
+        num_samples=256, 
+        shape_type="mix",
+        device=device,
+        img_size=16
+    )
+    
+    test_loader = synthetic_shapes_loader(
+        batch_size=32, 
+        num_samples=32, 
+        shape_type="mix",
+        device=device,
+        img_size=16
+    )
+    
+    print(f"Train Dataset Size: {len(train_loader.dataset)} | Test Dataset Size: {len(test_loader.dataset)}")
+    x_example, _ = next(iter(train_loader))
+    print(f"Shape of one batch (next(iter...)): {x_example.shape}")
+
+    
+    # Model Setup
+    scheduler = LinearNoiseScheduler(num_timesteps=250).to(device)
+    model = SimpleUnet(input_dim=1, use_attention=True).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    
+    # Visualize Forward Process
+    # Note: next(iter(loader)) is already on GPU now
+    sample_batch = next(iter(train_loader))[0] 
+    visualize_forward_process(scheduler, sample_batch[:1], device, "results/ddpm/forward_overview.png")
+    sample_shape = sample_batch.shape[1:]
+
+    # Main Training Loop
     training_start_time = time.perf_counter()
-    # 4. Training Loop
-    for epoch in range(num_epochs):
+    seen_samples = 0
+    
+    # Initialize Accumulators on Device
+    acc_metrics = {
+        "loss": torch.tensor(0.0, device=device),
+        "grad_norm": torch.tensor(0.0, device=device),
+        "pred_mean": torch.tensor(0.0, device=device),
+        "pred_std": torch.tensor(0.0, device=device)
+    }
+    acc_steps = 0
+
+    for epoch in range(NUM_EPOCHS):
         model.train()
-        train_loss = 0
         
         for x, _ in train_loader:
-            x = x.to(device)
+            # Call the helper function
+            metrics = train_batch(model, scheduler, optimizer, x, use_weighted_loss=True)
             
-            # We use the train_batch helper we defined earlier
-            # It handles sampling t, adding noise, predicting, and backprop
-            loss_val = train_batch(model, scheduler, optimizer, x)
+            # Accumulate (Fast GPU addition)
+            for k, v in metrics.items():
+                acc_metrics[k] += v
             
-            # train_batch returns a detached tensor or float, so we just add it
-            train_loss += loss_val
+            acc_steps += 1
 
+        seen_samples += len(train_loader.dataset)
         synchronize()
-        if (epoch + 1) % 500 == 0:
-            print(f"Epoch {epoch+1}, Loss: {train_loss/len(train_loader):.5f}, Elapsed time: {time.perf_counter() - training_start_time:.2f}s")
         
-        if (epoch + 1) % 2000 == 0 or epoch == num_epochs - 1 or epoch == 0:
-            # 5. Evaluation & Sampling
+        # Logging
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            # Move to CPU only once per interval
+            avg = {k: v.item() / acc_steps for k, v in acc_metrics.items()}
+            
+            elapsed = time.perf_counter() - training_start_time
+            
+            print(f"Epoch {epoch+1} | Samples: {seen_samples} | Time: {elapsed:.0f}s")
+            print(f"  > Loss: {avg['loss']:.5f}")
+            print(f"  > Grads: {avg['grad_norm']:.4f}") 
+            print(f"  > Preds: μ={avg['pred_mean']:.3f}, σ={avg['pred_std']:.3f}")
+            
+            # Reset
+            for k in acc_metrics: acc_metrics[k].zero_()
+            acc_steps = 0
+             
+        # Evaluation
+        if (epoch + 1) % EVAL_INTERVAL == 0 or epoch == NUM_EPOCHS - 1 or epoch == 0:
             model.eval()
             test_loss = 0
-            
-            # Validation Loss (How well do we predict noise on unseen data?)
             with torch.no_grad():
                 for x, _ in test_loader:
-                    x = x.to(device)
-                    # Replicate train logic but without backprop
                     t = torch.randint(0, scheduler.num_timesteps, (x.shape[0],), device=device)
                     noise = torch.randn_like(x)
                     xt = scheduler.q_sample(x, t, noise)
@@ -420,68 +519,6 @@ if __name__ == "__main__":
                     loss = F.mse_loss(noise_pred, noise)
                     test_loss += loss.item()
 
-            # Sampling with Snapshots
-            # We will generate 4 samples and visualize 6 steps for each
-            n_vis_samples = 4
-            # Define specific timesteps we want to see (e.g., 999, 800, 600, 400, 200, 0)
-            snapshot_steps = torch.linspace(
-                scheduler.num_timesteps - 1, 0, steps=6, dtype=torch.long
-            ).tolist()
-            
-            # 1. Start with pure noise
-            x = torch.randn((n_vis_samples, sample_shape[1], sample_shape[2], sample_shape[3]), device=device)
-            history = [] # To store the snapshots
-
-            # 2. Manual Sampling Loop to capture intermediates
-            for i in reversed(range(scheduler.num_timesteps)):
-                t = torch.full((n_vis_samples,), i, device=device, dtype=torch.long)
-                
-                # Predict noise
-                noise_pred = model(x, t)
-
-                # Get coefficients (Reusing your extract logic)
-                sqrt_alpha_inv = extract(scheduler.sqrt_alpha_inverse, t, x.shape)
-                beta_over_sigma = extract(scheduler.beta_over_sqrt_one_minus_alpha_cumprod, t, x.shape)
-                sqrt_beta = extract(scheduler.sqrt_beta, t, x.shape)
-
-                # Calculate the Mean
-                mean = sqrt_alpha_inv * (x - beta_over_sigma * noise_pred)
-
-                # Update x
-                if i > 0:
-                    noise = torch.randn_like(x)
-                    x = mean + sqrt_beta * noise
-                else:
-                    x = mean
-                
-                # Save snapshot if this step is in our list
-                if i in snapshot_steps:
-                    history.append(x.detach().cpu())
-
-            # 3. Visualization
-            # Rows = Different Samples, Cols = Time Steps
-            fig, axs = plt.subplots(n_vis_samples, len(snapshot_steps), figsize=(12, 6))
-            
-            # history is currently [t=999, t=800, ..., t=0]
-            
-            for row in range(n_vis_samples):
-                for col, step_idx in enumerate(snapshot_steps):
-                    # Get the specific image tensor
-                    img_tensor = history[col][row] 
-                    
-                    # Inverse Transform: [-1, 1] -> [0, 1]
-                    img_disp = (img_tensor + 1) / 2
-                    img_disp = img_disp.clamp(0, 1).squeeze(0)
-
-                    axs[row, col].imshow(img_disp, cmap='gray')
-                    
-                    # Only set labels on the top row
-                    if row == 0:
-                        axs[row, col].set_title(f"t={step_idx}")
-                    axs[row, col].axis('off')
-            
-            plt.tight_layout()
-            plt.savefig(f"results/ddpm/ddpm_epoch_{epoch+1}.png")
-            plt.close(fig)
-
-            print(f"Test Loss: {test_loss/len(test_loader):.5f}")
+            print(f" >> Epoch {epoch+1} Validation Loss: {test_loss/len(test_loader):.5f}")
+            save_file = f"results/ddpm/ddpm_epoch_{epoch+1}.png"
+            sample_and_save_snapshot(model, scheduler, sample_shape, device, epoch, save_file)
