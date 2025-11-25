@@ -78,25 +78,25 @@ class SimpleUnet(nn.Module):
         # Down: 28 -> 14 -> 7 (or 9 -> 5 -> 3)
         self.downblock = nn.Sequential(
             nn.Conv2d(input_dim, 32, 3, padding=1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Conv2d(64, 64, 3, stride=2, padding=1),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
         self.time_embedder = nn.Sequential(
             nn.Embedding(1000, 64),
             nn.Linear(64, 64),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
         # Up: 7 -> 14 -> 28 (or 3 -> 6 -> 12)
         self.upblock = nn.Sequential(
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Conv2d(16, input_dim, 3, padding=1)
         )
 
@@ -281,7 +281,7 @@ if __name__ == "__main__":
         """
         # 1. Create the canvas (1 channel, 9x9) with background -1
         # Shape: [1, 28, 28]
-        size = 15
+        size = 25
         img = torch.full((1, size, size), -1.0)
         
         # 2. Draw the cross with foreground 1
@@ -312,12 +312,13 @@ if __name__ == "__main__":
     device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     synchronize = torch.mps.synchronize if torch.backends.mps.is_available() else (torch.cuda.synchronize if torch.cuda.is_available() else lambda: None)
     train_loader = synthetic_cross_loader(batch_size=512, num_samples=1024)
+    test_loader = synthetic_cross_loader(batch_size=1, num_samples=1)
 
     print(f"Using device: {device}")
 
     # 3. Instantiate Model & Scheduler
     # Scheduler buffers move to device automatically when .to(device) is called
-    scheduler = LinearNoiseScheduler(num_timesteps=100).to(device)
+    scheduler = LinearNoiseScheduler(num_timesteps=250).to(device)
     model = SimpleUnet(input_dim=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
@@ -344,11 +345,11 @@ if __name__ == "__main__":
     
     sample_shape = next(iter(train_loader))[0].shape
 
+    training_start_time = time.perf_counter()
     # 4. Training Loop
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        start_time = time.perf_counter()
         
         for x, _ in train_loader:
             x = x.to(device)
@@ -362,7 +363,7 @@ if __name__ == "__main__":
 
         synchronize()
         if (epoch + 1) % 500 == 0:
-            print(f"Epoch {epoch+1}, Loss: {train_loss/len(train_loader):.5f}, Time: {time.perf_counter() - start_time:.2f}s")
+            print(f"Epoch {epoch+1}, Loss: {train_loss/len(train_loader):.5f}, Elapsed time: {time.perf_counter() - training_start_time:.2f}s")
         
         if (epoch + 1) % 2000 == 0 or epoch == num_epochs - 1 or epoch == 0:
             # 5. Evaluation & Sampling
