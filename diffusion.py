@@ -75,46 +75,84 @@ def extract(
 class SimpleUnet(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-        # Down: 28 -> 14 -> 7 (or 9 -> 5 -> 3)
-        self.downblock = nn.Sequential(
+        
+        # --- ENCODER (Down) ---
+        
+        # Layer 1: Input -> 32
+        self.down1 = nn.Sequential(
             nn.Conv2d(input_dim, 32, 3, padding=1),
-            nn.GELU(),
+            nn.GELU()
+        )
+        
+        # Layer 2: 32 -> 64 (Downsample)
+        self.down2 = nn.Sequential(
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.GELU(),
+            nn.GELU()
+        )
+        
+        # Layer 3: 64 -> 64 (Downsample)
+        self.down3 = nn.Sequential(
             nn.Conv2d(64, 64, 3, stride=2, padding=1),
-            nn.GELU(),
+            nn.GELU()
         )
 
+        # --- TIME EMBEDDING ---
         self.time_embedder = nn.Sequential(
             nn.Embedding(1000, 64),
             nn.Linear(64, 64),
             nn.GELU(),
         )
 
-        # Up: 7 -> 14 -> 28 (or 3 -> 6 -> 12)
-        self.upblock = nn.Sequential(
+        # --- DECODER (Up) ---
+        # Channels are adjusted to handle concatenation
+        
+        # Up 1: Input 64 (from down3) -> Output 32
+        # We will concatenate this with down2 (64 ch). Total next input = 32 + 64 = 96
+        self.up1 = nn.Sequential(
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, input_dim, 3, padding=1)
+            nn.GELU()
         )
+        
+        # Up 2: Input 96 -> Output 16
+        # We will concatenate this with down1 (32 ch). Total next input = 16 + 32 = 48
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(96, 16, 4, stride=2, padding=1),
+            nn.GELU()
+        )
+        
+        # Up 3: Input 48 -> Output input_dim
+        self.up3 = nn.Conv2d(48, input_dim, 3, padding=1)
 
     def forward(self, x, t):
-        # 1. Downsample
-        x_down = self.downblock(x) 
+        # --- DOWN PASS ---
+        x1 = self.down1(x)   # Save x1 (32 ch, Full Size)
+        x2 = self.down2(x1)  # Save x2 (64 ch, Half Size)
+        x3 = self.down3(x2)  # Bottom  (64 ch, Quarter Size)
         
-        # 2. Add Time Embedding
+        # --- TIME INJECTION ---
         time_emb = self.time_embedder(t)[:, :, None, None] 
-        x_down = x_down + time_emb 
+        x3 = x3 + time_emb 
 
-        # 3. Upsample
-        output = self.upblock(x_down)
+        # --- UP PASS ---
         
-        if output.shape[-2:] != x.shape[-2:]:
-            output = F.interpolate(output, size=x.shape[-2:], mode='bilinear', align_corners=False)
-            
-        return output
+        # Block 1
+        x_up = self.up1(x3)
+        # Resize to match skip connection (Fixes 9x9 vs 12x12 issue)
+        if x_up.shape[-2:] != x2.shape[-2:]:
+            x_up = F.interpolate(x_up, size=x2.shape[-2:], mode='bilinear', align_corners=False)
+        # Concatenate: (Batch, 32+64, H, W)
+        x_up = torch.cat([x_up, x2], dim=1) 
+
+        # Block 2
+        x_up = self.up2(x_up)
+        # Resize to match skip connection
+        if x_up.shape[-2:] != x1.shape[-2:]:
+            x_up = F.interpolate(x_up, size=x1.shape[-2:], mode='bilinear', align_corners=False)
+        # Concatenate: (Batch, 16+32, H, W)
+        x_up = torch.cat([x_up, x1], dim=1) 
+
+        # Final Layer
+        return self.up3(x_up)
 
 
 @beartype
