@@ -38,19 +38,17 @@ class forward:
         (1-self.beta_t[t]) * torch.eye(self.seq_len) + self.beta_t[t] * torch.ones(self.seq_len, self.seq_len)
 
 
-class Embedder:
+class Tokenizer:
     def __init__(self, dictionary: list):
         self.id_to_tok = {i: tok for i, tok in enumerate(dictionary)}
         self.tok_to_id = {tok: i for i, tok in self.id_to_tok.items()}
         self.dict = dictionary
         self.size = len(dictionary)
 
-    def encode(self, x: str) -> torch.Tensor:
-        ids = torch.tensor([self.tok_to_id[tok] for tok in x])
-        return torch.nn.functional.one_hot(ids, num_classes=self.size)        
+    def encode(self, x: list[str]) -> torch.Tensor:
+        return torch.tensor([self.tok_to_id[tok] for tok in x])       
     
     def decode(self, x: torch.Tensor) -> str:
-        ids = torch.argmax(x, axis=1)
-        return "".join([self.id_to_tok[i.item()] for i in ids])
+        return "".join([self.id_to_tok[i.item()] for i in x])
 
-emb = Embedder(string.printable)
+tokenizer = Tokenizer(string.printable)
