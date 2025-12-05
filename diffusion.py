@@ -120,7 +120,6 @@ class SimpleUnet(nn.Module):
 
         # --- BOTTLENECK ATTENTION ---
         if self.use_attention:
-            # REMOVED size=7. It now adapts to 4x4, 7x7, or whatever comes in.
             self.attn = SelfAttention(channels=64) 
 
         # --- TIME EMBEDDING ---
@@ -142,7 +141,6 @@ class SimpleUnet(nn.Module):
         self.up3 = nn.Conv2d(48, input_dim, 3, padding=1)
 
     def forward(self, x, t):
-        # ... (Your forward logic remains exactly the same) ...
         x1 = self.down1(x)
         x2 = self.down2(x1)
         x3 = self.down3(x2)
@@ -183,42 +181,30 @@ def train_batch(
 
     batch_size = x0.shape[0]
     
-    # 1. Sample random timesteps t
     t = torch.randint(low=0, high=scheduler.num_timesteps, size=(batch_size,), device=x0.device)
     
-    # 2. Create the noise (epsilon)
     noise = torch.randn_like(x0)
     
-    # 3. Create the noisy image (x_t)
     xt = scheduler.q_sample(x0, t, noise)
     
-    # 4. Predict the noise
     noise_pred = model(xt, t)
     
-    # 5. Calculate Loss
     if use_weighted_loss:
-        # Calculate per-pixel squared error
         loss_unreduced = F.mse_loss(noise_pred, noise, reduction='none')
         
-        # Define Weights: Background (-1) gets 1.0, Signal (>-0.5) gets 10.0
         weights = torch.ones_like(x0)
         weights[x0 > -0.5] = 10.0
         
-        # Apply weights and reduce
         loss = (loss_unreduced * weights).mean()
     else:
         loss = F.mse_loss(noise_pred, noise)
     
-    # 6. Backward
     loss.backward()
     
-    # 7. Clip Gradients & Get Norm (Crucial for stability)
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     
-    # 8. Step
     optimizer.step()
     
-    # 9. Return Metrics (Detached to avoid memory leaks/graph retention)
     return {
         "loss": loss.detach(),
         "grad_norm": grad_norm.detach(),
@@ -478,10 +464,8 @@ if __name__ == "__main__":
         model.train()
         
         for x, _ in train_loader:
-            # Call the helper function
             metrics = train_batch(model, scheduler, optimizer, x, use_weighted_loss=True)
             
-            # Accumulate (Fast GPU addition)
             for k, v in metrics.items():
                 acc_metrics[k] += v
             
@@ -492,7 +476,6 @@ if __name__ == "__main__":
         
         # Logging
         if (epoch + 1) % LOG_INTERVAL == 0:
-            # Move to CPU only once per interval
             avg = {k: v.item() / acc_steps for k, v in acc_metrics.items()}
             
             elapsed = time.perf_counter() - training_start_time
@@ -502,8 +485,8 @@ if __name__ == "__main__":
             print(f"  > Grads: {avg['grad_norm']:.4f}") 
             print(f"  > Preds: μ={avg['pred_mean']:.3f}, σ={avg['pred_std']:.3f}")
             
-            # Reset
-            for k in acc_metrics: acc_metrics[k].zero_()
+            for k in acc_metrics: 
+                acc_metrics[k].zero_()
             acc_steps = 0
              
         # Evaluation

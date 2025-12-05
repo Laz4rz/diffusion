@@ -3,6 +3,7 @@ from typing import Literal
 import torch
 from torch import nn
 from einops import rearrange
+from torch.nn import functional as F  # noqa: F401
 
 class Forward(nn.Module):
     def __init__(
@@ -153,3 +154,22 @@ xhat = torch.clone(x)
 for i in range(50):
     xhat = forward.qt(x=xhat, t=i)
     print(tokenizer.decode(xhat))
+
+def loss():
+    pass
+
+
+
+# xt = forward.apply_qtcum(x0, t)
+# x0pred = model(xt)
+# 
+# Lvb := Dkl[q(xt-1 | xt, x0) || p(xt-1 | xt)]
+# p(xt-1 | xt) = sum_x'0 (q(xt, xt-1 | x'0) * p(x'0 | xt)) / q(xt | x'0)
+
+# q: [T, K, K]
+# q(xt, xt-1 | x'0) = q(xt | xt-1, x'0) * q(xt-1 | x'0) =(Markov)= q(xt | xt-1) * q(xt-1 | x'0)
+# when calculating loss:
+# q(xt | xt-1) = qt[t, :, xt_id] [K]
+# (explicit sum) q(xt-1 | x'0) = qtcum[t-1, x'0_id, :] [K]
+# (implicit sum) q(xt-1 | x'0) = qtcum[t-1, :, :] [K, K]
+# 
