@@ -2,8 +2,8 @@ import string
 from typing import Literal
 import torch
 from torch import nn
-from einops import rearrange
-from torch.nn import functional as F  # noqa: F401
+from torch.nn import functional as F
+
 
 class Forward(nn.Module):
     def __init__(
@@ -36,12 +36,15 @@ class Forward(nn.Module):
         self.register_buffer("qt_tensors", self._init_qt())
 
     def apply_qtcum(self, x: torch.Tensor, t: int=1) -> torch.Tensor:
-        return Forward.batch_sample_multinomial(self.qtcum_tensors[t][x])
+        if isinstance(t, int):
+            return Forward.batch_sample_multinomial(self.qtcum_tensors[t][x])
+        else:
+            return Forward.batch_sample_multinomial(self.qtcum_tensors[torch.randint(0, self.steps, size=(x.shape[0],))][:, x])
     
     @staticmethod
     def batch_sample_multinomial(dists: torch.Tensor) -> torch.Tensor:
-        samples = torch.multinomial(rearrange(dists, "B S K -> (B S) K"), 1)
-        return rearrange(samples, "(B S) 1 -> B S", B=dists.shape[0])
+        samples = torch.multinomial(dists.view(-1, dists.shape[-1]), 1)
+        return samples.view(dists.shape[:-1])
 
     def _init_one_minut_beta_cum(self) -> torch.Tensor:
         return torch.cumprod(1 - self.beta_t_tensors, dim=0)[:, None, None]
@@ -143,22 +146,18 @@ class Tokenizer:
 
 # maybe nicer if forward needed tokenizer to avoid vocab size mistakes
 # I skip the padding token from K, add mask
-forward = Forward(beta_t=0.03, K=len(string.printable)+2, T=50, noise_type="absorbing", absorbing_id=len(string.printable), pad_id=len(string.printable)+1)
-tokenizer = Tokenizer(string.printable)
+# forward = Forward(beta_t=0.03, K=len(string.printable)+2, T=50, noise_type="absorbing", absorbing_id=len(string.printable), pad_id=len(string.printable)+1)
+# tokenizer = Tokenizer(string.printable)
 
-x = tokenizer.encode(["hello", "bye"])
-print("Encoded:", x)
-print("Decoded:", tokenizer.decode(x))
-
-xhat = torch.clone(x)
-for i in range(50):
-    xhat = forward.qt(x=xhat, t=i)
-    print(tokenizer.decode(xhat))
-
-def loss():
-    pass
+# x = tokenizer.encode(["hello", "bye"])
+# print("Encoded:", x)
+# print("Decoded:", tokenizer.decode(x))
 
 
+# xhat = torch.clone(x)
+# for i in range(50):
+#     xhat = forward.qt(x=xhat, t=i)
+#     print(tokenizer.decode(xhat))
 
 # xt = forward.apply_qtcum(x0, t)
 # x0pred = model(xt)
@@ -167,9 +166,121 @@ def loss():
 # p(xt-1 | xt) = sum_x'0 (q(xt, xt-1 | x'0) * p(x'0 | xt)) / q(xt | x'0)
 
 # q: [T, K, K]
+#
 # q(xt, xt-1 | x'0) = q(xt | xt-1, x'0) * q(xt-1 | x'0) =(Markov)= q(xt | xt-1) * q(xt-1 | x'0)
 # when calculating loss:
 # q(xt | xt-1) = qt[t, :, xt_id] [K]
 # (explicit sum) q(xt-1 | x'0) = qtcum[t-1, x'0_id, :] [K]
 # (implicit sum) q(xt-1 | x'0) = qtcum[t-1, :, :] [K, K]
-# 
+#
+# q(xt-1|xt, x0) = [q(xt | xt-1) * q(xt-1 | x0)] / q(xt | x0)
+# q(xt-1|xt, x0) = qt[t, :, xt_id] * qtcum[t-1, x0_id, :] / qtcum[t, x0_id, xt_id]
+
+# sample x0 -> x0
+# sample t -> t
+# apply t to x0 -> xt
+# pass xt to model -> pred
+
+def hybrid_loss(t, x0, xt, pred, pad_id, forward):
+    # direct loss
+    lax = F.cross_entropy(pred.flatten(0, 1), x0.flatten(0, 1), ignore_index=pad_id)
+
+    B, L, K = pred.shape
+
+    # NVLB (trajectory, t to t-1) loss
+    qt = forward.qt_tensors
+    qtcum = forward.qtcum_tensors
+    probs = F.softmax(pred, dim=-1)
+    # weight x0: x_t-1 by corresponding model prediction of x0
+    # "based on model prediction, onto which t-1 token distribution I land with what probability"
+    qp_sum = probs @ qtcum[t-1]
+    # probs: [1, K] (Row vector)
+    # qtcum: [K, K] (Matrix)
+    # weigh tokens by the probability of landing on correct xt
+    constraint = qt[t, :, xt.reshape(-1)].T.reshape(B, L, K)
+    p_prev = qp_sum * constraint
+    p_prev /= (p_prev.sum(dim=2, keepdim=True) + 1e-8)
+
+    q_prev_cond = qt[t, :, xt.reshape(-1)].T.reshape(B, L, K) * qtcum[t-1, x0, :]
+    q_prev_cond /= (q_prev_cond.sum(dim=2, keepdim=True) + 1e-8)
+
+    pad_mask = (x0 != pad_id)
+    p_prev = p_prev.clamp_min(1e-8)[pad_mask]
+    q_prev_cond = q_prev_cond.clamp_min(1e-8)[pad_mask]
+    lvb = F.kl_div(input=p_prev.log(), target=q_prev_cond, reduction="batchmean")
+
+    return lax+lvb
+
+def train_batch(model, forward, optimizer, x0):
+    model.train()
+    optimizer.zero_grad()
+
+    # batch_size = x0.shape[0]
+
+    # t = torch.randint(low=0, high=forward.steps, size=batch_size, device=x0.device)
+    t = torch.randint(
+            low=1,
+            high=forward.steps,
+            size=(1,),
+            device=x0.device,
+        ).item()    
+    xt = forward.apply_qtcum(x0, t)
+    pred = model(xt)
+
+    loss = hybrid_loss(t, x0, xt, pred, forward.pad_id, forward)
+
+    loss.backward()
+    optimizer.step()
+
+class SimpleModel(nn.Module):
+    def __init__(self, vocab_size, d_model=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.linear = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        emb = self.embedding(x)      # [B, L, d_model]
+        logits = self.linear(emb)    # [B, L, vocab_size]
+        return logits
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tokenizer = Tokenizer(string.printable, max_len=8)
+    K = tokenizer.pad_id + 1
+    T = 50
+
+    forward = Forward(
+        beta_t=0.03,
+        K=K,
+        T=T,
+        pad_id=tokenizer.pad_id,
+        noise_type="absorbing",
+        absorbing_id=tokenizer.mask_id,
+    ).to(device)
+
+    model = SimpleModel(vocab_size=K, d_model=128).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    words = ["hello", "world", "cat", "dog", "trick", "noise", "model", "data"]
+    x0 = tokenizer.encode(words, device=device, padding_strategy="max_len")  # [8, L]
+
+    for step in range(2000):
+        loss = train_batch(model, forward, optimizer, x0)
+        if step % 200 == 0:
+            print(f"step {step:4d} | loss {loss:.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        t_eval = T - 1
+        xt = forward.apply_qtcum(x0, t_eval)
+        pred = model(xt)
+        x0_hat = pred.argmax(dim=-1)
+
+        print("target:", tokenizer.decode(x0))
+        print("recon: ", tokenizer.decode(x0_hat))
+
+
+if __name__ == "__main__":
+    main()
