@@ -5,6 +5,10 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def safe_str(s):
+    return s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
 class Forward(nn.Module):
     def __init__(
             self, 
@@ -334,7 +338,7 @@ def main():
 
     for step in range(100000):
         loss, lax, lvb = train_batch(model, forward, optimizer, x0)
-        if step % 200 == 0:
+        if step % 300 == 0:
             print(f"\nstep {step:4d} | loss {loss.item():.4f} | lvb {lvb.item():.4f} | lax {lax.item():.4f}")
 
             model.eval()
@@ -347,9 +351,18 @@ def main():
                     xt = sample_prev(pred, forward, xt, t_eval)
                 sl = slice(None)
                 sl = slice(0, 8)
-                print("Noised:", *tokenizer.decode(xT)[sl], sep="\n")
-                print("Target:", *tokenizer.decode(x0)[sl], sep="\n")
-                print("Reconstructed:", *tokenizer.decode(xt)[sl], sep="\n")
+                noised_txt = tokenizer.decode(xT)
+                target_txt = tokenizer.decode(x0)
+                recon_txt = tokenizer.decode(xt)
+
+                print("-" * 60)
+                # Loop through the first 3 examples (or all)
+                for i, (n, t, r) in enumerate(zip(noised_txt[sl], target_txt[sl], recon_txt[sl])):
+                    print(f"Example {i}:")
+                    print(f"  Noised : {n}")
+                    print(f"  Target : {t}")
+                    print(f"  Recon  : {safe_str(r)}")
+                    print("-" * 60)
 
 
 if __name__ == "__main__":
