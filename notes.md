@@ -272,3 +272,7 @@ And in this diffusion model setting we only want to learn the decoder $p_\theta(
 https://mbernste.github.io/posts/vae/ \
 https://yunfanj.com/blog/2021/01/11/ELBO.html \
 https://www.wpeebles.com/DiT
+
+### Other:
+- identity for 1st qtcum is extremely important
+- 

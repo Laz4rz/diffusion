@@ -12,3 +12,6 @@ dependencies = [
     "torch>=2.9.1",
     "torchvision>=0.24.1",
 ]
+
+[tool.ruff.lint]
+ignore = ["E701", "E702"]
